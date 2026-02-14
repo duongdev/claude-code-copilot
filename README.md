@@ -27,7 +27,7 @@ All Claude models available through your Copilot subscription work out of the bo
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-code-copilot.git
+git clone https://github.com/samarth777/claude-code-copilot.git
 cd claude-code-copilot
 ```
 
