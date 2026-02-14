@@ -1,0 +1,20 @@
+{
+  "name": "claude-code-copilot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Use Claude Code for free via GitHub Copilot — local proxy that translates Anthropic API to Copilot API",
+  "scripts": {
+    "auth": "node scripts/auth.mjs",
+    "proxy": "node scripts/proxy.mjs",
+    "start": "bash scripts/launch.sh"
+  },
+  "keywords": [
+    "claude-code",
+    "github-copilot",
+    "anthropic",
+    "proxy",
+    "ai"
+  ],
+  "license": "MIT"
+}
