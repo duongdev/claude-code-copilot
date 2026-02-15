@@ -114,7 +114,6 @@ The proxy emulates Anthropic's `web_search_20250305` server-side tool, so Claude
 
 1. **Brave Search API** — Best results. Set `BRAVE_API_KEY` env var (free tier: 2000 queries/month at [api.search.brave.com](https://api.search.brave.com/))
 2. **DuckDuckGo Lite** — Free, no API key needed. Used by default.
-3. **DuckDuckGo Instant Answer** — Last resort fallback.
 
 To use Brave Search with Docker:
 
