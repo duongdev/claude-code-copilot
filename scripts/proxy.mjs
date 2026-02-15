@@ -20,6 +20,342 @@ const AUTH_FILE =
   process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
+const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
+
+// ─── Web Search ──────────────────────────────────────────────────────────────
+
+/**
+ * Execute a web search using available providers.
+ * Priority: Brave Search API > DuckDuckGo HTML > DuckDuckGo Instant Answer API
+ */
+async function executeWebSearch(query) {
+  console.log(`  🔍 Executing web search: "${query}"`)
+
+  if (BRAVE_API_KEY) {
+    const results = await braveSearch(query)
+    if (results && results.length > 0) return results
+    console.log(`  ⚠ Brave Search failed, trying DuckDuckGo Lite...`)
+  }
+
+  const ddgLiteResults = await duckDuckGoLiteSearch(query)
+  if (ddgLiteResults && ddgLiteResults.length > 0) return ddgLiteResults
+
+  console.log(`  ⚠ DuckDuckGo Lite failed, trying instant answer API...`)
+  const instantResults = await duckDuckGoInstantAnswer(query)
+  if (instantResults && instantResults.length > 0) return instantResults
+
+  console.log(`  ⚠ All search providers failed`)
+  return []
+}
+
+async function braveSearch(query) {
+  try {
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${WEB_SEARCH_MAX_RESULTS}`
+    const res = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": BRAVE_API_KEY,
+      },
+    })
+    if (!res.ok) {
+      console.log(`  ⚠ Brave API error: ${res.status}`)
+      return null
+    }
+    const data = await res.json()
+    const results = (data.web?.results || []).slice(0, WEB_SEARCH_MAX_RESULTS)
+    console.log(`  ✓ Brave Search returned ${results.length} results`)
+    return results.map((r) => ({
+      type: "web_search_result",
+      url: r.url,
+      title: r.title || "",
+      encrypted_content: Buffer.from(r.description || "").toString("base64"),
+      page_age: r.age || null,
+    }))
+  } catch (err) {
+    console.log(`  ⚠ Brave Search error: ${err.message}`)
+    return null
+  }
+}
+
+async function duckDuckGoLiteSearch(query) {
+  try {
+    const res = await fetch("https://lite.duckduckgo.com/lite/", {
+      method: "POST",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      body: `q=${encodeURIComponent(query)}&kl=us-en`,
+      redirect: "follow",
+    })
+    if (!res.ok) {
+      console.log(`  ⚠ DDG Lite HTTP error: ${res.status}`)
+      return null
+    }
+    const html = await res.text()
+
+    // Check for CAPTCHA
+    if (html.includes("captcha") || html.includes("anomaly") || html.includes("challenge")) {
+      console.log(`  ⚠ DDG Lite returned CAPTCHA`)
+      return null
+    }
+
+    const results = []
+
+    // Extract result-link elements: <a ... class='result-link'>Title</a>
+    const linkRegex = /<a\s+rel="nofollow"\s+href="([^"]+)"\s+class='result-link'>([\s\S]*?)<\/a>/g
+    let match
+    const links = []
+    while ((match = linkRegex.exec(html)) !== null) {
+      links.push({
+        url: match[1],
+        title: match[2]
+          .replace(/<\/?b>/g, "")
+          .replace(/&#x27;/g, "'")
+          .replace(/&#92;/g, "\\")
+          .replace(/&amp;/g, "&")
+          .replace(/&quot;/g, '"')
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .trim(),
+      })
+    }
+
+    // Extract result-snippet elements: <td class='result-snippet'>...</td>
+    const snippetRegex = /<td\s+class='result-snippet'>\s*([\s\S]*?)\s*<\/td>/g
+    const snippets = []
+    while ((match = snippetRegex.exec(html)) !== null) {
+      snippets.push(
+        match[1]
+          .replace(/<\/?b>/g, "")
+          .replace(/&#x27;/g, "'")
+          .replace(/&#92;/g, "\\")
+          .replace(/&amp;/g, "&")
+          .replace(/&quot;/g, '"')
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/\s+/g, " ")
+          .trim()
+      )
+    }
+
+    // Combine links + snippets into results
+    for (let i = 0; i < Math.min(links.length, WEB_SEARCH_MAX_RESULTS); i++) {
+      const snippet = i < snippets.length ? snippets[i] : links[i].title
+      results.push({
+        type: "web_search_result",
+        url: links[i].url,
+        title: links[i].title,
+        encrypted_content: Buffer.from(snippet).toString("base64"),
+        page_age: null,
+      })
+    }
+
+    console.log(`  ✓ DDG Lite returned ${results.length} results`)
+    return results.length > 0 ? results : null
+  } catch (err) {
+    console.log(`  ⚠ DDG Lite error: ${err.message}`)
+    return null
+  }
+}
+
+async function duckDuckGoInstantAnswer(query) {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+
+    const results = []
+
+    // Main abstract
+    if (data.AbstractURL && data.AbstractText) {
+      results.push({
+        type: "web_search_result",
+        url: data.AbstractURL,
+        title: data.Heading || query,
+        encrypted_content: Buffer.from(data.AbstractText).toString("base64"),
+        page_age: null,
+      })
+    }
+
+    // Related topics
+    for (const topic of (data.RelatedTopics || []).slice(0, WEB_SEARCH_MAX_RESULTS - results.length)) {
+      if (topic.FirstURL && topic.Text) {
+        results.push({
+          type: "web_search_result",
+          url: topic.FirstURL,
+          title: topic.Text.substring(0, 100),
+          encrypted_content: Buffer.from(topic.Text).toString("base64"),
+          page_age: null,
+        })
+      }
+    }
+
+    console.log(`  ✓ DuckDuckGo Instant Answer returned ${results.length} results`)
+    return results.length > 0 ? results : null
+  } catch (err) {
+    console.log(`  ⚠ DDG Instant Answer error: ${err.message}`)
+    return null
+  }
+}
+
+/**
+ * Collect a full non-streaming response from Copilot.
+ * Used internally for the web search tool call loop.
+ */
+async function collectCopilotResponse(openaiReq, token) {
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+    "User-Agent": USER_AGENT,
+    "Openai-Intent": "conversation-edits",
+    "x-initiator": "user",
+  }
+  const hasImages = JSON.stringify(openaiReq.messages).includes("image_url")
+  if (hasImages) headers["Copilot-Vision-Request"] = "true"
+
+  const reqBody = { ...openaiReq, stream: false }
+  const copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(reqBody),
+  })
+  if (!copilotRes.ok) {
+    const errorText = await copilotRes.text()
+    throw new Error(`Copilot API error (${copilotRes.status}): ${errorText}`)
+  }
+  return copilotRes.json()
+}
+
+/**
+ * Handle the web search tool call loop.
+ *
+ * When the model returns a web_search tool call, we:
+ * 1. Execute the search ourselves
+ * 2. Feed results back to the model
+ * 3. Repeat until no more web_search calls
+ * 4. Build up the content blocks for the Anthropic response
+ *
+ * Returns { contentBlocks, openaiResponse, searchCount }
+ */
+async function handleWebSearchLoop(openaiReq, token, maxSearches) {
+  const contentBlocks = [] // Accumulated Anthropic content blocks
+  let searchCount = 0
+  let currentReq = { ...openaiReq }
+  let lastResponse = null
+
+  for (let iteration = 0; iteration < (maxSearches || 5) + 1; iteration++) {
+    const response = await collectCopilotResponse(currentReq, token)
+    lastResponse = response
+
+    const choice = response.choices?.[0]
+    if (!choice) break
+
+    // Check if there's a web_search tool call
+    const webSearchCall = choice.message?.tool_calls?.find(
+      (tc) => tc.function?.name === "web_search"
+    )
+
+    if (!webSearchCall || searchCount >= (maxSearches || 5)) {
+      // No web search — we're done. Add any text content.
+      if (choice.message?.content) {
+        contentBlocks.push({ type: "text", text: choice.message.content })
+      }
+      // Add non-web-search tool calls if any
+      if (choice.message?.tool_calls) {
+        for (const tc of choice.message.tool_calls) {
+          contentBlocks.push({
+            type: "tool_use",
+            id: tc.id,
+            name: tc.function.name,
+            input: (() => { try { return JSON.parse(tc.function.arguments) } catch { return {} } })(),
+          })
+        }
+      }
+      break
+    }
+
+    // We have a web_search tool call
+    searchCount++
+    let searchQuery = ""
+    try {
+      searchQuery = JSON.parse(webSearchCall.function.arguments)?.query || ""
+    } catch {
+      searchQuery = webSearchCall.function.arguments || ""
+    }
+
+    // Add any text before the search
+    if (choice.message?.content) {
+      contentBlocks.push({ type: "text", text: choice.message.content })
+    }
+
+    // Add server_tool_use block (Anthropic format)
+    const toolUseId = `srvtoolu_${Date.now()}_${searchCount}`
+    contentBlocks.push({
+      type: "server_tool_use",
+      id: toolUseId,
+      name: "web_search",
+      input: { query: searchQuery },
+    })
+
+    // Execute the search
+    const searchResults = await executeWebSearch(searchQuery)
+
+    // Add web_search_tool_result block
+    contentBlocks.push({
+      type: "web_search_tool_result",
+      tool_use_id: toolUseId,
+      content: searchResults.length > 0 ? searchResults : {
+        type: "web_search_tool_result_error",
+        error_code: "unavailable",
+      },
+    })
+
+    // Build search results text for the model
+    let searchResultsText = ""
+    if (searchResults.length > 0) {
+      searchResultsText = "Web search results:\n\n"
+      for (const r of searchResults) {
+        const content = Buffer.from(r.encrypted_content, "base64").toString("utf-8")
+        searchResultsText += `Title: ${r.title}\nURL: ${r.url}\nSnippet: ${content}\n\n`
+      }
+    } else {
+      searchResultsText = "Web search returned no results."
+    }
+
+    // Build follow-up messages: original + assistant's tool call + tool result
+    const followUpMessages = [
+      ...currentReq.messages,
+      {
+        role: "assistant",
+        content: choice.message?.content || null,
+        tool_calls: [webSearchCall],
+      },
+      {
+        role: "tool",
+        tool_call_id: webSearchCall.id,
+        content: searchResultsText,
+      },
+    ]
+
+    // Also add any other tool calls from this response (non-web-search)
+    const otherToolCalls = (choice.message?.tool_calls || []).filter(
+      (tc) => tc.function?.name !== "web_search"
+    )
+    // We'll handle these in the next iteration or final response
+
+    currentReq = { ...openaiReq, messages: followUpMessages }
+  }
+
+  return { contentBlocks, lastResponse: lastResponse, searchCount }
+}
 
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
@@ -186,12 +522,30 @@ function translateMessages(anthropicMessages, system) {
       } else if (Array.isArray(msg.content)) {
         const textParts = msg.content.filter((p) => p.type === "text")
         const toolUses = msg.content.filter((p) => p.type === "tool_use")
+        // server_tool_use and web_search_tool_result are Anthropic web search blocks
+        // We strip them for Copilot and inject their content as context text
+        const serverToolUses = msg.content.filter((p) => p.type === "server_tool_use")
+        const webSearchResults = msg.content.filter((p) => p.type === "web_search_tool_result")
+
+        // Build text from regular text + web search context
+        let textContent = textParts.map((p) => p.text).join("\n")
+
+        // Include web search results as context for the model
+        for (const wsResult of webSearchResults) {
+          if (Array.isArray(wsResult.content)) {
+            for (const r of wsResult.content) {
+              if (r.type === "web_search_result" && r.title && r.url) {
+                textContent += `\n[Search result: ${r.title} - ${r.url}]`
+              }
+            }
+          }
+        }
 
         const assistantMsg = {
           role: "assistant",
           content:
-            textParts.length > 0
-              ? textParts.map((p) => p.text).join("\n")
+            textContent.length > 0
+              ? textContent
               : toolUses.length > 0
                 ? null
                 : "",
@@ -221,14 +575,33 @@ function translateMessages(anthropicMessages, system) {
 function translateTools(anthropicTools) {
   if (!anthropicTools || anthropicTools.length === 0) return undefined
 
-  return anthropicTools.map((tool) => ({
-    type: "function",
-    function: {
-      name: tool.name,
-      description: tool.description || "",
-      parameters: tool.input_schema || { type: "object", properties: {} },
-    },
-  }))
+  return anthropicTools
+    .filter((tool) => tool.type !== "web_search_20250305") // Handled separately by proxy
+    .map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.input_schema || { type: "object", properties: {} },
+      },
+    }))
+}
+
+/**
+ * Check if the request includes a web_search tool and extract its config.
+ * Returns { hasWebSearch, maxUses, allowedDomains, blockedDomains, userLocation }
+ */
+function extractWebSearchConfig(anthropicTools) {
+  if (!anthropicTools) return { hasWebSearch: false }
+  const wsTool = anthropicTools.find((t) => t.type === "web_search_20250305")
+  if (!wsTool) return { hasWebSearch: false }
+  return {
+    hasWebSearch: true,
+    maxUses: wsTool.max_uses || 5,
+    allowedDomains: wsTool.allowed_domains || null,
+    blockedDomains: wsTool.blocked_domains || null,
+    userLocation: wsTool.user_location || null,
+  }
 }
 
 // ─── Response Translation (OpenAI → Anthropic) ──────────────────────────────
@@ -579,8 +952,14 @@ async function handleRequest(req, res, token) {
   const copilotModel = mapModel(anthropicReq.model)
   const isStream = anthropicReq.stream === true
 
+  // Check for web_search tool
+  const wsConfig = extractWebSearchConfig(anthropicReq.tools)
+  if (wsConfig.hasWebSearch) {
+    console.log(`  🔍 Web search enabled (max_uses: ${wsConfig.maxUses})`)
+  }
+
   console.log(
-    `→ ${anthropicReq.model} → ${copilotModel} | ${isStream ? "stream" : "sync"} | ${anthropicReq.messages?.length || 0} messages`
+    `→ ${anthropicReq.model} → ${copilotModel} | ${isStream ? "stream" : "sync"} | ${anthropicReq.messages?.length || 0} messages${wsConfig.hasWebSearch ? " | 🔍 web_search" : ""}`
   )
 
   // Build OpenAI request
@@ -601,6 +980,31 @@ async function handleRequest(req, res, token) {
 
   if (anthropicReq.tools) {
     openaiReq.tools = translateTools(anthropicReq.tools)
+    if (!openaiReq.tools || openaiReq.tools.length === 0) {
+      delete openaiReq.tools
+    }
+  }
+
+  // If web search is enabled, add the web_search function tool for Copilot
+  if (wsConfig.hasWebSearch) {
+    if (!openaiReq.tools) openaiReq.tools = []
+    openaiReq.tools.push({
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for current information. Use this when you need up-to-date facts, news, or information that may not be in your training data.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query to look up on the web",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    })
   }
 
   if (anthropicReq.stop_sequences) {
@@ -624,6 +1028,174 @@ async function handleRequest(req, res, token) {
   }
 
   try {
+    // ── Web Search Path: use internal loop (always non-streaming internally) ──
+    if (wsConfig.hasWebSearch) {
+      console.log(`  ⚡ Using web search loop (internally non-streaming)`)
+      try {
+        const { contentBlocks, lastResponse, searchCount } = await handleWebSearchLoop(
+          openaiReq, token, wsConfig.maxUses
+        )
+
+        const usage = lastResponse?.usage || {}
+        const anthropicResponse = {
+          id: lastResponse?.id || `msg_${Date.now()}`,
+          type: "message",
+          role: "assistant",
+          model: anthropicReq.model,
+          content: contentBlocks.length > 0 ? contentBlocks : [{ type: "text", text: "" }],
+          stop_reason: contentBlocks.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn",
+          stop_sequence: null,
+          usage: {
+            input_tokens: usage.prompt_tokens || 0,
+            output_tokens: usage.completion_tokens || 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            server_tool_use: searchCount > 0 ? { web_search_requests: searchCount } : undefined,
+          },
+        }
+
+        if (isStream) {
+          // Emit the response as streaming SSE events
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          })
+
+          // message_start
+          const startEvent = `event: message_start\ndata: ${JSON.stringify({
+            type: "message_start",
+            message: {
+              id: anthropicResponse.id,
+              type: "message",
+              role: "assistant",
+              model: anthropicReq.model,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: anthropicResponse.usage.input_tokens, output_tokens: 0 },
+            },
+          })}\n\n`
+          res.write(startEvent)
+
+          // Emit each content block
+          for (let i = 0; i < contentBlocks.length; i++) {
+            const block = contentBlocks[i]
+
+            if (block.type === "text") {
+              // content_block_start
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: i,
+                content_block: { type: "text", text: "" },
+              })}\n\n`)
+
+              // content_block_delta - send text in chunks for natural streaming feel
+              const chunkSize = 50
+              for (let j = 0; j < block.text.length; j += chunkSize) {
+                const textChunk = block.text.substring(j, j + chunkSize)
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                  type: "content_block_delta",
+                  index: i,
+                  delta: { type: "text_delta", text: textChunk },
+                })}\n\n`)
+              }
+
+              // content_block_stop
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: i,
+              })}\n\n`)
+            } else if (block.type === "server_tool_use") {
+              // Emit server_tool_use block
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: i,
+                content_block: {
+                  type: "server_tool_use",
+                  id: block.id,
+                  name: block.name,
+                  input: {},
+                },
+              })}\n\n`)
+
+              // Emit the query as input_json_delta
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                type: "content_block_delta",
+                index: i,
+                delta: {
+                  type: "input_json_delta",
+                  partial_json: JSON.stringify(block.input),
+                },
+              })}\n\n`)
+
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: i,
+              })}\n\n`)
+            } else if (block.type === "web_search_tool_result") {
+              // Emit web_search_tool_result block
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: i,
+                content_block: block,
+              })}\n\n`)
+
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: i,
+              })}\n\n`)
+            } else if (block.type === "tool_use") {
+              // Regular tool use
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: i,
+                content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+              })}\n\n`)
+
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                type: "content_block_delta",
+                index: i,
+                delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+              })}\n\n`)
+
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: i,
+              })}\n\n`)
+            }
+          }
+
+          // message_delta
+          res.write(`event: message_delta\ndata: ${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: anthropicResponse.stop_reason, stop_sequence: null },
+            usage: { output_tokens: anthropicResponse.usage.output_tokens },
+          })}\n\n`)
+
+          // message_stop
+          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`)
+          res.end()
+        } else {
+          // Non-streaming: return the full response
+          res.writeHead(200, { "Content-Type": "application/json" })
+          res.end(JSON.stringify(anthropicResponse))
+        }
+
+        console.log(`  ✓ Response sent (${searchCount} web searches performed)`)
+        return
+      } catch (err) {
+        console.error(`✗ Web search loop error: ${err.message}`)
+        // Fall through to normal path without web search
+        console.log(`  ↓ Falling back to normal path without web search`)
+        if (openaiReq.tools) {
+          openaiReq.tools = openaiReq.tools.filter((t) => t.function?.name !== "web_search")
+          if (openaiReq.tools.length === 0) delete openaiReq.tools
+        }
+      }
+    }
+
+    // ── Normal Path (no web search) ──
     const copilotRes = await fetch(
       `${COPILOT_API_BASE}/chat/completions`,
       {
@@ -760,6 +1332,13 @@ server.listen(PORT, () => {
   console.log(`✓ Proxy server running on http://localhost:${PORT}`)
   console.log()
   console.log("  Translates: Anthropic Messages API → Copilot Chat Completions API")
+  console.log()
+  if (BRAVE_API_KEY) {
+    console.log("  🔍 Web Search: Brave Search API (configured)")
+  } else {
+    console.log("  🔍 Web Search: DuckDuckGo Lite (free, no API key)")
+    console.log("     For better results, set BRAVE_API_KEY (free at https://api.search.brave.com/)")
+  }
   console.log()
   console.log("  Use Claude Code with:")
   console.log(
