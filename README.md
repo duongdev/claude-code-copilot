@@ -1,7 +1,9 @@
 # Claude Code via GitHub Copilot
 
 <p align="center">
-  <img src="assets/claude-copilot.png" alt="Claude Code via GitHub Copilot" width="600" />
+<img width="993" height="248" alt="pipeline" src="https://github.com/user-attachments/assets/bdc80db2-97b2-4515-ae13-ef220ba3b21c" />
+
+  <img src="assets/claude-copilot.png" alt="Claude Code via GitHub Copilot" width="993" />
 </p>
 
 Use **Claude Code for free** by routing it through your existing GitHub Copilot subscription.
