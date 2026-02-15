@@ -1,0 +1,13 @@
+services:
+  proxy:
+    build: .
+    container_name: claude-copilot-proxy
+    restart: always
+    ports:
+      - "18080:18080"
+    volumes:
+      - ~/.claude-copilot-auth.json:/root/.claude-copilot-auth.json:ro
+    environment:
+      - COPILOT_PROXY_PORT=18080
+      - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - WEB_SEARCH_MAX_RESULTS=${WEB_SEARCH_MAX_RESULTS:-5}

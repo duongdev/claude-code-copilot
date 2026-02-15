@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
-# Launch script: starts the proxy in the background and runs Claude Code
+# Launch script: ensures the Docker proxy is running, then starts Claude Code
 # Usage: ./scripts/launch.sh [claude-code-args...]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PORT="${COPILOT_PROXY_PORT:-18080}"
 AUTH_FILE="${COPILOT_AUTH_FILE:-$HOME/.claude-copilot-auth.json}"
 
@@ -16,32 +17,55 @@ if [ ! -f "$AUTH_FILE" ]; then
     exit 1
 fi
 
-# Check if proxy is already running
+# Check if proxy is already running (Docker or otherwise)
 if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
     echo "✓ Proxy already running on port $PORT"
 else
-    echo "Starting proxy server..."
-    node "$SCRIPT_DIR/proxy.mjs" &
-    PROXY_PID=$!
+    # Try Docker first, fall back to direct node
+    if command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
+        echo "Starting proxy via Docker (restart: always)..."
+        cd "$PROJECT_DIR"
+        docker-compose up -d --build 2>/dev/null || docker compose up -d --build
+        
+        # Wait for proxy to be ready
+        for i in $(seq 1 30); do
+            if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+        done
 
-    # Wait for proxy to be ready
-    for i in $(seq 1 30); do
-        if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
-            break
+        if ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
+            echo "✗ Docker proxy failed to start, falling back to node..."
+            node "$SCRIPT_DIR/proxy.mjs" &
+            PROXY_PID=$!
+            for i in $(seq 1 30); do
+                if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then break; fi
+                sleep 0.2
+            done
+            trap "kill $PROXY_PID 2>/dev/null" EXIT
+        else
+            echo "✓ Proxy running in Docker (auto-restarts on reboot)"
         fi
-        sleep 0.2
-    done
+    else
+        echo "Starting proxy server (no Docker found)..."
+        node "$SCRIPT_DIR/proxy.mjs" &
+        PROXY_PID=$!
 
-    if ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
-        echo "✗ Proxy failed to start"
-        kill $PROXY_PID 2>/dev/null
-        exit 1
+        for i in $(seq 1 30); do
+            if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then break; fi
+            sleep 0.2
+        done
+
+        if ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
+            echo "✗ Proxy failed to start"
+            kill $PROXY_PID 2>/dev/null
+            exit 1
+        fi
+
+        echo "✓ Proxy started (PID: $PROXY_PID)"
+        trap "echo 'Stopping proxy...'; kill $PROXY_PID 2>/dev/null" EXIT
     fi
-
-    echo "✓ Proxy started (PID: $PROXY_PID)"
-
-    # Clean up proxy on exit
-    trap "echo 'Stopping proxy...'; kill $PROXY_PID 2>/dev/null" EXIT
 fi
 
 echo "Starting Claude Code via Copilot..."
