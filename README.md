@@ -66,13 +66,6 @@ The proxy emulates Anthropic's web search tool so Claude Code's WebSearch works 
 - **DuckDuckGo Lite** — Free, no API key needed (default)
 
 ## How It Works
-```
-┌─────────────┐    Anthropic API     ┌──────────────┐    OpenAI API      ┌──────────────────────┐
-│             │    (Messages)        │              │    (Chat Compl.)   │                      │
-│ Claude Code │ ──────────────────▶  │  Local Proxy │ ──────────────────▶│ api.githubcopilot.com│
-│             │ ◀──────────────────  │  :18080      │ ◀──────────────────│                      │
-└─────────────┘                      └──────────────┘                    └──────────────────────┘
-```
 
 Claude Code sends requests in Anthropic format → proxy translates to OpenAI format → forwarded to GitHub Copilot → responses translated back. No data is stored or logged.
 
