@@ -1,14 +1,16 @@
 # Claude Code via GitHub Copilot
 
 <p align="center">
-<img width="993" height="248" alt="pipeline" src="https://github.com/user-attachments/assets/bdc80db2-97b2-4515-ae13-ef220ba3b21c" />
-
-  <img src="assets/claude-copilot.png" alt="Claude Code via GitHub Copilot" width="993" />
+<img alt="pipeline" src="https://github.com/user-attachments/assets/bdc80db2-97b2-4515-ae13-ef220ba3b21c" width="full"/>
 </p>
 
 Use **Claude Code for free** by routing it through your existing GitHub Copilot subscription.
 
 This project runs a lightweight local proxy that translates between Anthropic's Messages API (which Claude Code speaks) and OpenAI's Chat Completions API (which GitHub Copilot speaks). No Anthropic API key needed — just your Copilot subscription.
+
+<p align="center">
+  <img src="assets/claude-copilot.png" alt="Claude Code via GitHub Copilot" width="full" />
+</p>
 
 ## Features
 
