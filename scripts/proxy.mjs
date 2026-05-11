@@ -23,6 +23,113 @@ const USER_AGENT = "claude-code-copilot-provider/1.0.0"
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
 
+// Copilot enforces a hard 128K input cap for Claude models regardless of the
+// model's native context window. Leave headroom for system prompt + tools.
+const MAX_PROMPT_TOKENS = parseInt(process.env.COPILOT_MAX_PROMPT_TOKENS || "115000", 10)
+const TOOL_RESULT_MAX_CHARS = parseInt(process.env.COPILOT_TOOL_RESULT_MAX_CHARS || "25000", 10)
+const KEEP_RECENT_TOOL_RESULTS = parseInt(process.env.COPILOT_KEEP_RECENT_TOOL_RESULTS || "2", 10)
+const CHARS_PER_TOKEN = 3.5
+
+// ─── Context Compaction ──────────────────────────────────────────────────────
+
+function truncateToolResultBlock(block) {
+  const tag = (n) => `\n\n…[truncated ${n} chars by proxy to fit Copilot's 128K prompt cap]`
+  if (typeof block.content === "string") {
+    if (block.content.length <= TOOL_RESULT_MAX_CHARS) return block
+    const cut = block.content.length - TOOL_RESULT_MAX_CHARS
+    return { ...block, content: block.content.slice(0, TOOL_RESULT_MAX_CHARS) + tag(cut) }
+  }
+  if (Array.isArray(block.content)) {
+    let changed = false
+    const newContent = block.content.map((p) => {
+      if (p.type === "text" && typeof p.text === "string" && p.text.length > TOOL_RESULT_MAX_CHARS) {
+        changed = true
+        const cut = p.text.length - TOOL_RESULT_MAX_CHARS
+        return { ...p, text: p.text.slice(0, TOOL_RESULT_MAX_CHARS) + tag(cut) }
+      }
+      return p
+    })
+    return changed ? { ...block, content: newContent } : block
+  }
+  return block
+}
+
+function isOrphanToolResult(msg) {
+  return (
+    msg?.role === "user" &&
+    Array.isArray(msg.content) &&
+    msg.content.length > 0 &&
+    msg.content.every((p) => p.type === "tool_result")
+  )
+}
+
+function estimateTokens(req) {
+  const text =
+    JSON.stringify(req.messages || []) +
+    JSON.stringify(req.system || "") +
+    JSON.stringify(req.tools || [])
+  return Math.ceil(text.length / CHARS_PER_TOKEN)
+}
+
+function compactRequest(req) {
+  if (!Array.isArray(req.messages) || req.messages.length === 0) return req
+
+  // Step 1: locate every tool_result in user messages
+  const locations = []
+  req.messages.forEach((msg, mi) => {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) return
+    msg.content.forEach((part, pi) => {
+      if (part.type === "tool_result") locations.push({ mi, pi })
+    })
+  })
+
+  let truncatedCount = 0
+  let newMessages = req.messages
+  const toTruncate = locations.slice(0, Math.max(0, locations.length - KEEP_RECENT_TOOL_RESULTS))
+  if (toTruncate.length > 0) {
+    const keyed = new Set(toTruncate.map((l) => `${l.mi}:${l.pi}`))
+    newMessages = req.messages.map((msg, mi) => {
+      if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
+      let changed = false
+      const newContent = msg.content.map((part, pi) => {
+        if (part.type !== "tool_result" || !keyed.has(`${mi}:${pi}`)) return part
+        const next = truncateToolResultBlock(part)
+        if (next !== part) {
+          changed = true
+          truncatedCount++
+        }
+        return next
+      })
+      return changed ? { ...msg, content: newContent } : msg
+    })
+  }
+
+  // Step 2: drop oldest messages while estimate exceeds budget; preserve pairs
+  let droppedCount = 0
+  let estimate = estimateTokens({ ...req, messages: newMessages })
+  if (estimate > MAX_PROMPT_TOKENS) {
+    let trimmed = [...newMessages]
+    while (estimate > MAX_PROMPT_TOKENS && trimmed.length > 2) {
+      trimmed.shift()
+      droppedCount++
+      while (trimmed.length > 0 && isOrphanToolResult(trimmed[0])) {
+        trimmed.shift()
+        droppedCount++
+      }
+      estimate = estimateTokens({ ...req, messages: trimmed })
+    }
+    newMessages = trimmed
+  }
+
+  if (truncatedCount > 0 || droppedCount > 0) {
+    console.log(
+      `  ✂ Compaction: truncated ${truncatedCount} old tool_result(s), dropped ${droppedCount} message(s), est ~${estimate} tokens`
+    )
+  }
+
+  return truncatedCount > 0 || droppedCount > 0 ? { ...req, messages: newMessages } : req
+}
+
 // ─── Web Search ──────────────────────────────────────────────────────────────
 
 /**
@@ -360,26 +467,32 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
+  // Opus 4.7
+  "claude-opus-4-7": "claude-opus-4.7",
+  "claude-opus-4-7-latest": "claude-opus-4.7",
   // Opus 4.6
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-6-20260214": "claude-opus-4.6",
   "claude-opus-4-6-latest": "claude-opus-4.6",
+  // Sonnet 4.6
+  "claude-sonnet-4-6": "claude-sonnet-4.6",
+  "claude-sonnet-4-6-latest": "claude-sonnet-4.6",
   // Sonnet 4.5
   "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
   "claude-sonnet-4-5": "claude-sonnet-4.5",
   "claude-sonnet-4-5-latest": "claude-sonnet-4.5",
-  // Sonnet 4
-  "claude-sonnet-4-20250514": "claude-sonnet-4",
-  "claude-sonnet-4": "claude-sonnet-4",
-  "claude-3-5-sonnet-20241022": "claude-sonnet-4",
-  "claude-3-5-sonnet-latest": "claude-sonnet-4",
+  // Sonnet 4 (no native copilot model — route to 4.5)
+  "claude-sonnet-4-20250514": "claude-sonnet-4.5",
+  "claude-sonnet-4": "claude-sonnet-4.5",
+  "claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
+  "claude-3-5-sonnet-latest": "claude-sonnet-4.5",
   // Opus 4.5
   "claude-opus-4-5": "claude-opus-4.5",
   "claude-opus-4-5-20251101": "claude-opus-4.5",
   "claude-opus-4-5-latest": "claude-opus-4.5",
-  // Opus 4.1
-  "claude-opus-4-1": "claude-opus-41",
-  "claude-opus-4-1-latest": "claude-opus-41",
+  // Opus 4.1 (no native copilot model — route to 4.5)
+  "claude-opus-4-1": "claude-opus-4.5",
+  "claude-opus-4-1-latest": "claude-opus-4.5",
   // Haiku 4.5
   "claude-haiku-4-5": "claude-haiku-4.5",
   "claude-haiku-4-5-20251001": "claude-haiku-4.5",
@@ -388,6 +501,7 @@ const MODEL_MAP = {
   "claude-3-5-haiku-20241022": "claude-haiku-4.5",
   "claude-3-haiku-20240307": "claude-haiku-4.5",
   // Legacy opus
+  "claude-opus-4-20250514": "claude-opus-4.5",
   "claude-opus-4-20250918": "claude-opus-4.5",
   "claude-3-opus-20240229": "claude-opus-4.5",
   "claude-3-5-opus-latest": "claude-opus-4.5",
@@ -399,11 +513,12 @@ function mapModel(anthropicModel) {
 
   // Try pattern matching for unknown dated versions
   const m = anthropicModel.toLowerCase()
+  if (m.includes("opus") && (m.includes("4.7") || m.includes("4-7"))) return "claude-opus-4.7"
   if (m.includes("opus") && (m.includes("4.6") || m.includes("4-6"))) return "claude-opus-4.6"
-  if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
-  if (m.includes("sonnet")) return "claude-sonnet-4"
   if (m.includes("opus") && (m.includes("4.5") || m.includes("4-5"))) return "claude-opus-4.5"
-  if (m.includes("opus") && (m.includes("4.1") || m.includes("4-1") || m.includes("41"))) return "claude-opus-41"
+  if (m.includes("sonnet") && (m.includes("4.6") || m.includes("4-6"))) return "claude-sonnet-4.6"
+  if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
+  if (m.includes("sonnet")) return "claude-sonnet-4.5"
   if (m.includes("haiku")) return "claude-haiku-4.5"
   if (m.includes("opus")) return "claude-opus-4.6"
 
@@ -677,6 +792,7 @@ function createStreamTranslator(model, res) {
   let messageId = `msg_${Date.now()}`
   let inputTokens = 0
   let outputTokens = 0
+  let cacheReadTokens = 0
   let sentStart = false
   let toolCallBuffers = {} // id -> {name, arguments}
 
@@ -716,8 +832,16 @@ function createStreamTranslator(model, res) {
         // Send message_stop
         sendSSE("message_delta", {
           type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          delta: {
+            stop_reason: this._stopReason || "end_turn",
+            stop_sequence: null,
+          },
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cacheReadTokens,
+          },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true // done
@@ -733,8 +857,13 @@ function createStreamTranslator(model, res) {
       sendStartIfNeeded()
 
       if (data.usage) {
-        inputTokens = data.usage.prompt_tokens || inputTokens
+        const cached = data.usage.prompt_tokens_details?.cached_tokens || 0
+        // Anthropic's input_tokens excludes cached tokens; surface them
+        // separately via cache_read_input_tokens.
+        inputTokens =
+          (data.usage.prompt_tokens || inputTokens + cached) - cached
         outputTokens = data.usage.completion_tokens || outputTokens
+        cacheReadTokens = cached
       }
 
       const choice = data.choices?.[0]
@@ -813,9 +942,11 @@ function createStreamTranslator(model, res) {
         }
       }
 
-      // Handle finish
+      // Handle finish — close content blocks now, but defer message_delta /
+      // message_stop emission. With stream_options.include_usage, Copilot
+      // sends a final chunk with usage AFTER the finish_reason chunk; if we
+      // emit message_stop here we'd report 0 input/output tokens.
       if (choice.finish_reason) {
-        // Close any open blocks
         if (this._inTextBlock) {
           sendSSE("content_block_stop", {
             type: "content_block_stop",
@@ -824,7 +955,6 @@ function createStreamTranslator(model, res) {
           this._inTextBlock = false
         }
 
-        // Close tool call blocks
         for (const idx of Object.keys(toolCallBuffers)) {
           sendSSE("content_block_stop", {
             type: "content_block_stop",
@@ -835,20 +965,14 @@ function createStreamTranslator(model, res) {
         let stopReason = "end_turn"
         if (choice.finish_reason === "tool_calls") stopReason = "tool_use"
         else if (choice.finish_reason === "length") stopReason = "max_tokens"
-
-        sendSSE("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
-        })
-        sendSSE("message_stop", { type: "message_stop" })
-        return true
+        this._stopReason = stopReason
       }
 
       return false
     },
 
     _inTextBlock: false,
+    _stopReason: null,
   }
 }
 
@@ -952,6 +1076,11 @@ async function handleRequest(req, res, token) {
   const copilotModel = mapModel(anthropicReq.model)
   const isStream = anthropicReq.stream === true
 
+  // Compact request to fit under Copilot's 128K prompt cap.
+  // Chrome DevTools MCP / CDP snapshots are the dominant cost driver — we
+  // truncate older tool_result blocks first, then drop oldest message pairs.
+  anthropicReq = compactRequest(anthropicReq)
+
   // Check for web_search tool
   const wsConfig = extractWebSearchConfig(anthropicReq.tools)
   if (wsConfig.hasWebSearch) {
@@ -968,6 +1097,48 @@ async function handleRequest(req, res, token) {
     messages: translateMessages(anthropicReq.messages, anthropicReq.system),
     max_tokens: anthropicReq.max_tokens || 4096,
     stream: isStream,
+  }
+
+  // Ask Copilot to include token usage in the final streaming chunk.
+  // Without this OpenAI-compatible servers omit `usage` in SSE, so Claude
+  // Code sees 0 input/output tokens every turn.
+  if (isStream) {
+    openaiReq.stream_options = { include_usage: true }
+  }
+
+  // Forward reasoning_effort to Copilot when CCD requests extended thinking.
+  // CCD signals effort via either:
+  //   - output_config.effort: "low" | "medium" | "high"
+  //   - thinking.type: "adaptive" | "enabled" (with budget_tokens)
+  // Per-model behavior in Copilot (verified empirically — adjust as needed):
+  //   claude-haiku-4.5     → does not support reasoning_effort at all
+  //   claude-haiku-*       → assume same
+  //   claude-sonnet-4.5    → does not support reasoning_effort (older sonnet)
+  //   claude-opus-4.7      → caps at "medium"
+  //   claude-opus-4.6      → supports up to "high"
+  //   claude-sonnet-4.6    → supports up to "high"
+  //   others               → try "high", let Copilot reject if unsupported
+  const ccdEffort = anthropicReq.output_config?.effort
+  const wantsThinking =
+    ccdEffort ||
+    anthropicReq.thinking?.type === "adaptive" ||
+    anthropicReq.thinking?.type === "enabled" ||
+    anthropicReq.thinking?.budget_tokens
+  const noEffortModels = new Set([
+    "claude-haiku-4.5",
+    "claude-sonnet-4.5",
+    "claude-opus-4.5",
+  ])
+  if (wantsThinking && !noEffortModels.has(copilotModel)) {
+    const cap = {
+      "claude-opus-4.7": "medium",
+    }
+    const requested = ccdEffort || "high"
+    const max = cap[copilotModel]
+    // Pick the lower of requested vs cap
+    const order = { low: 1, medium: 2, high: 3 }
+    openaiReq.reasoning_effort =
+      max && order[requested] > order[max] ? max : requested
   }
 
   if (anthropicReq.temperature !== undefined) {
