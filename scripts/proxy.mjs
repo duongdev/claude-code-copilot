@@ -58,6 +58,11 @@ function cfgInt(envName, fileKey, fallback) {
   const n = parseInt(raw, 10)
   return Number.isFinite(n) ? n : fallback
 }
+function cfgFloat(envName, fileKey, fallback) {
+  const raw = cfgString(envName, fileKey, String(fallback))
+  const n = parseFloat(raw)
+  return Number.isFinite(n) ? n : fallback
+}
 
 const PORT = cfgInt("COPILOT_PROXY_PORT", "proxy_port", 18080)
 const AUTH_FILE = cfgString(
@@ -79,6 +84,16 @@ const KEEP_RECENT_TOOL_RESULTS = cfgInt("COPILOT_KEEP_RECENT_TOOL_RESULTS", "kee
 // estimates here cause us to ship requests Copilot will then 400.
 const CHARS_PER_TOKEN = 3.0
 const PROXY_API_KEY = cfgString("COPILOT_PROXY_API_KEY", "proxy_api_key", "")
+// GitHub's public pricing for premium-request overage is $0.04/request (post-
+// multiplier — the `remaining` count from /copilot_internal/user already has
+// the per-model multiplier applied, so this rate is uniform regardless of
+// which Claude/GPT model the user actually called). Configurable in case
+// GitHub changes the price or the user's org has a custom rate.
+const PREMIUM_REQUEST_OVERAGE_USD = cfgFloat(
+  "COPILOT_PREMIUM_REQUEST_OVERAGE_USD",
+  "premium_request_overage_usd",
+  0.04
+)
 
 // ─── Context Compaction ──────────────────────────────────────────────────────
 
@@ -609,12 +624,56 @@ async function fetchCopilotUsage(githubOAuthToken) {
   return data
 }
 
+// Compute overage cost (USD). When `remaining` is negative, every unit beyond
+// entitlement bills at PREMIUM_REQUEST_OVERAGE_USD — but only if
+// overage_permitted is true (otherwise GitHub blocks the request instead of
+// charging). Returns 0 when under quota or when overage is blocked.
+function computeOverageCost(pi) {
+  if (!pi || !pi.overage_permitted) return 0
+  const overage = Math.max(0, -(pi.remaining ?? 0))
+  return overage * PREMIUM_REQUEST_OVERAGE_USD
+}
+
+// Linearly project month-end cost from current burn rate. Heuristic — assumes
+// the rest of the period continues at the same daily pace as the elapsed
+// period. Useful as an early warning, not a precise forecast. Returns null
+// when we can't compute (missing dates, period not started, etc.).
+function projectMonthEndCost(usage) {
+  const pi = usage?.quota_snapshots?.premium_interactions
+  if (!pi || pi.unlimited || !pi.overage_permitted) return null
+  const resetDateStr = (usage?.quota_reset_date || "").slice(0, 10)
+  const assignedStr = usage?.assigned_date
+  if (!resetDateStr || !assignedStr) return null
+  const resetDate = new Date(`${resetDateStr}T00:00:00Z`)
+  // Period start is the first of the current cycle. Reset is the 1st of the
+  // following month, so period start = reset - 1 month. (GitHub bills monthly.)
+  const periodStart = new Date(resetDate)
+  periodStart.setUTCMonth(periodStart.getUTCMonth() - 1)
+  const now = new Date()
+  const totalMs = resetDate - periodStart
+  const elapsedMs = now - periodStart
+  if (totalMs <= 0 || elapsedMs <= 0) return null
+  const fractionElapsed = Math.min(1, elapsedMs / totalMs)
+  if (fractionElapsed < 0.05) return null // too early to project meaningfully
+  const entitlement = pi.entitlement || 0
+  const used = Math.max(0, entitlement - (pi.remaining ?? entitlement))
+  const overageSoFar = Math.max(0, -(pi.remaining ?? 0))
+  const projectedTotalUsage = used / fractionElapsed
+  const projectedOverage = Math.max(0, projectedTotalUsage - entitlement)
+  return projectedOverage * PREMIUM_REQUEST_OVERAGE_USD
+}
+
+function fmtUSD(n) {
+  if (!Number.isFinite(n) || n <= 0) return "$0.00"
+  return `$${n.toFixed(2)}`
+}
+
 // Friendly one-line summary for human display (statusline, slash command, etc).
-// When over quota, headline the overage count as a percentage of entitlement:
-//   "premium: 1200/300 (overage: 400% · billable)"
-// — the numerator is the overage, not total consumption, so the magnitude of
-// the breach is immediately visible. Under quota, show the conventional
-// used/entitlement.
+// When over quota, headline the overage count as a percentage of entitlement
+// AND the actual dollar cost so the magnitude of the breach is immediately
+// visible in both relative and absolute terms:
+//   "premium: 1200/300 (overage: 400% · $48.00 · billable)"
+// Under quota, show the conventional used/entitlement with no cost suffix.
 function summarizeUsage(u) {
   const plan = u?.copilot_plan || "unknown"
   const pi = u?.quota_snapshots?.premium_interactions
@@ -627,7 +686,11 @@ function summarizeUsage(u) {
     const overage = -pi.remaining
     const pct = Math.round((overage / entitlement) * 100)
     const billable = pi.overage_permitted ? "billable" : "blocked"
-    premiumLine = `premium: ${overage}/${entitlement} (overage: ${pct}% · ${billable})`
+    const cost = computeOverageCost(pi)
+    // Only show cost when billable — when blocked, no money is owed so the
+    // dollar figure is misleading.
+    const costSuffix = pi.overage_permitted ? ` · ${fmtUSD(cost)}` : ""
+    premiumLine = `premium: ${overage}/${entitlement} (overage: ${pct}%${costSuffix} · ${billable})`
   } else {
     const used = entitlement - Math.max(0, pi.remaining)
     premiumLine = `premium: ${used}/${entitlement}`
@@ -1482,7 +1545,17 @@ async function handleRequest(req, res, token) {
   if (url.startsWith("/v1/copilot/usage")) {
     try {
       const data = await fetchCopilotUsage(token)
-      const out = { summary: summarizeUsage(data), ...data }
+      const pi = data?.quota_snapshots?.premium_interactions
+      const overageCost = computeOverageCost(pi)
+      const projectedCost = projectMonthEndCost(data)
+      const out = {
+        summary: summarizeUsage(data),
+        overage_cost_usd: Number(overageCost.toFixed(2)),
+        projected_overage_cost_usd:
+          projectedCost == null ? null : Number(projectedCost.toFixed(2)),
+        premium_request_overage_rate_usd: PREMIUM_REQUEST_OVERAGE_USD,
+        ...data,
+      }
       console.log(`  ⚡ Usage → ${out.summary}`)
       res.writeHead(200, { "Content-Type": "application/json" })
       res.end(JSON.stringify(out, null, 2))

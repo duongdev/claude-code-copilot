@@ -7,16 +7,20 @@ Show the user their current GitHub Copilot usage and quota.
 
 1. Determine the proxy base URL (default `http://localhost:18080` unless the user has set `ANTHROPIC_BASE_URL` to point at the Copilot proxy).
 
-2. Fetch the usage endpoint. If the user has set `COPILOT_PROXY_API_KEY`, include it as `x-api-key`:
+2. Fetch the usage endpoint. Claude Code already has `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`) set to talk to the proxy — reuse whichever is present as `x-api-key`. The proxy treats `ANTHROPIC_AUTH_TOKEN`'s value as the shared secret when `COPILOT_PROXY_API_KEY` is enforced; if it isn't enforced, any value passes (or no header at all).
    ```bash
+   key="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}"
    curl -s "${ANTHROPIC_BASE_URL:-http://localhost:18080}/v1/copilot/usage" \
-     ${COPILOT_PROXY_API_KEY:+-H "x-api-key: $COPILOT_PROXY_API_KEY"}
+     ${key:+-H "x-api-key: $key"}
    ```
 
 3. Parse the JSON response and present a concise summary. The most useful fields:
    - `summary` — one-line human-readable summary (use this as the headline)
    - `copilot_plan` — `free` / `individual` / `business` / `enterprise`
    - `quota_snapshots.premium_interactions` — `entitlement` (monthly limit), `remaining`, `percent_remaining`, `overage_permitted`. Negative `remaining` means they've gone over and are accruing overage charges (only billed if `overage_permitted` is true).
+   - `overage_cost_usd` — current overage cost in USD (0 if under quota or overage blocked)
+   - `projected_overage_cost_usd` — linear projection of month-end overage cost based on current burn rate (`null` if too early to project or overage not billable)
+   - `premium_request_overage_rate_usd` — per-request overage rate (default `0.04`)
    - `quota_snapshots.chat` / `completions` — usually `unlimited: true` on paid plans
    - `quota_reset_date` — when premium counter rolls over (YYYY-MM-DD)
    - `organization_list` — which orgs are paying for the seat (if any)
@@ -24,13 +28,14 @@ Show the user their current GitHub Copilot usage and quota.
 4. Format example (when over quota):
    ```
    GitHub Copilot · business plan
-   Premium requests: 1200 / 300 (overage: 400% · billable)
+   Premium requests: 1200 / 300 (overage: 400% · $48.00 · billable)
+   Projected month-end: ~$72.00
    Chat / completions: unlimited
    Resets: 2026-01-01
    Org: your-org
    ```
 
-   When over quota, show overage count as numerator and entitlement as denominator — the "X%" is `(overage / entitlement) × 100`. Append `· billable` when `overage_permitted` is true, `· blocked` when false. When under quota, just show `{used} / {entitlement}` with no overage suffix.
+   When over quota: numerator is overage count, denominator is entitlement, `X%` is `(overage / entitlement) × 100`, dollar figure is `overage_cost_usd`. Append `· billable` when `overage_permitted` is true, `· blocked` (no dollar figure) when false. Show the projected line only when `projected_overage_cost_usd` is present and greater than the current cost. When under quota, just show `{used} / {entitlement}` with no overage / cost suffix.
 
 5. If the proxy returns 502 or the request fails, the proxy is likely not running or the OAuth token expired. Suggest:
    - Check the proxy is up: `curl http://localhost:18080/health`

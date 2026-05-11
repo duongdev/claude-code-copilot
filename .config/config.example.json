@@ -12,5 +12,7 @@
   "default_max_output": 16384,
 
   "brave_api_key": "",
-  "web_search_max_results": 5
+  "web_search_max_results": 5,
+
+  "premium_request_overage_usd": 0.04
 }

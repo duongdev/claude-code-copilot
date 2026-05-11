@@ -149,6 +149,7 @@ A full template is in [`.config/config.example.json`](.config/config.example.jso
 | `COPILOT_DEFAULT_MAX_OUTPUT` | `default_max_output` | *(model-aware)* | Override per-model `max_tokens` default |
 | `BRAVE_API_KEY` | `brave_api_key` | *(none)* | Brave Search API key for web search |
 | `WEB_SEARCH_MAX_RESULTS` | `web_search_max_results` | `5` | Max search results per query |
+| `COPILOT_PREMIUM_REQUEST_OVERAGE_USD` | `premium_request_overage_usd` | `0.04` | Per-request overage rate used by `/v1/copilot/usage` cost estimate |
 | `COPILOT_CONFIG_FILE` | — | *(see lookup order above)* | Override config file path |
 
 ## Checking your Copilot quota
@@ -156,10 +157,13 @@ A full template is in [`.config/config.example.json`](.config/config.example.jso
 The proxy exposes `GET /v1/copilot/usage` which returns your current GitHub Copilot plan, premium-request entitlement, remaining quota, and reset date. It proxies GitHub's undocumented `/copilot_internal/user` endpoint (the same one VS Code's Copilot extension uses) and caches for 5 minutes.
 
 ```bash
-curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .quota_snapshots.premium_interactions'
-# "Copilot business · premium: 1200/300 (overage: 400% · billable) · resets 2026-01-01"
-# { "entitlement": 300, "remaining": -1200, "overage_permitted": true, ... }
+curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .overage_cost_usd, .projected_overage_cost_usd'
+# "Copilot business · premium: 1200/300 (overage: 400% · $48.00 · billable) · resets 2026-01-01"
+# 48.00
+# 72.00
 ```
+
+When the user is over quota and `overage_permitted` is true, the response includes a cost estimate (`overage_cost_usd`) at the current rate (`premium_request_overage_rate_usd`, default `$0.04`/request) and a linear month-end projection (`projected_overage_cost_usd`) extrapolated from the elapsed-period burn rate.
 
 If `COPILOT_PROXY_API_KEY` is set, pass it as `x-api-key` or `Authorization: Bearer ...`.
 
