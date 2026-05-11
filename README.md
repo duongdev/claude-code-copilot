@@ -165,9 +165,16 @@ curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .overage_cost_us
 
 When the user is over quota and `overage_permitted` is true, the response includes a cost estimate (`overage_cost_usd`) at the current rate (`premium_request_overage_rate_usd`, default `$0.04`/request) and a linear month-end projection (`projected_overage_cost_usd`) extrapolated from the elapsed-period burn rate.
 
-If `COPILOT_PROXY_API_KEY` is set, pass it as `x-api-key` or `Authorization: Bearer ...`.
+If `COPILOT_PROXY_API_KEY` is set, pass it as `x-api-key` or `Authorization: Bearer ...`. For a formatted summary inside Claude Code, use the [`/copilot-usage`](commands/copilot-usage.md) slash command (see below).
 
-**Slash command for Claude Code.** Copy [`commands/copilot-usage.md`](commands/copilot-usage.md) into your CC commands directory (e.g. `~/.claude/commands/` or any plugin's `commands/` dir), then `/copilot-usage` inside Claude Code prints a formatted summary.
+## Slash commands
+
+Drop any of these into your Claude Code commands directory (`~/.claude/commands/` or a plugin's `commands/` dir) and invoke with `/<name>`.
+
+| Command | Purpose |
+|---|---|
+| [`/copilot-usage`](commands/copilot-usage.md) | Print your current Copilot plan, premium-request quota, overage cost, and reset date. Pinned to Haiku to keep the cost negligible. |
+| [`/setup-copilot`](commands/setup-copilot.md) | Walk through first-time setup: checks auth state, runs the device-code flow if needed, and shows how to start the proxy. |
 
 ## License
 
