@@ -120,6 +120,8 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy cla
 
 All settings can be passed as environment variables or as keys in a JSON config file at `~/.claude-copilot-config.json` (lowercase, no `COPILOT_` prefix). Precedence: **env var > config file > built-in default**.
 
+A full template is in [`.claude-copilot-config.example.json`](.claude-copilot-config.example.json) — copy it to `~/.claude-copilot-config.json`, delete the `_comment` key, edit to taste.
+
 ```json
 {
   "max_prompt_tokens": 100000,
