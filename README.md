@@ -8,9 +8,28 @@ Use **Claude Code for free** by routing it through your existing GitHub Copilot 
 
 This project runs a lightweight local proxy that translates between Anthropic's Messages API (which Claude Code speaks) and OpenAI's Chat Completions API (which GitHub Copilot speaks). No Anthropic API key needed — just your Copilot subscription.
 
+> **Fork notice** — this is an enhanced fork of [samarth777/claude-code-copilot](https://github.com/samarth777/claude-code-copilot). The upstream proxy is ~600 lines; this fork has roughly tripled the proxy code to add production-grade resilience, extended thinking, dynamic model discovery, optional auth, and config-file support. See [What's different in this fork](#whats-different-in-this-fork) for the full list.
+
 <p align="center">
   <img src="assets/claude-copilot.png" alt="Claude Code via GitHub Copilot" width="full" />
 </p>
+
+## What's different in this fork
+
+| Area | Upstream | This fork |
+|---|---|---|
+| Model list | Hardcoded array of 13 IDs | Live `GET /models` from Copilot (cached 1h) + Anthropic-style aliases; static fallback on outage |
+| Extended thinking | Not forwarded | `reasoning_content` → Anthropic `thinking` blocks (streaming + non-streaming); auto-sets `reasoning_effort` per model with caps (Opus 4.7 → medium, Haiku → off) |
+| Streaming usage | Reported 0 tokens | Defers `message_delta` until Copilot's final usage chunk arrives; falls back to estimation if omitted |
+| Long outputs | Single `max_tokens` default | Per-model defaults (16K Opus/Sonnet 4.6+, 8K Haiku/Sonnet 4.5), tunable |
+| Prompt overflow | None | Auto-truncates large tool results, recompacts on `prompt_too_long`, configurable target window |
+| Retries | None | 429/503 with `Retry-After` honored + exponential backoff |
+| Error mapping | Generic | Maps 503 → `overloaded_error`, 400 → `invalid_request_error`, etc. |
+| Stream keepalive | None | 10s SSE pings to prevent idle proxies / load balancers from killing the connection |
+| Auth | Open | Optional `COPILOT_PROXY_API_KEY` shared secret — safe to expose beyond localhost |
+| Configuration | Env vars only | Env vars + optional `~/.claude-copilot-config.json` (env > file > default) |
+| `cache_control` blocks | Passed through (Copilot rejects) | Stripped before forwarding |
+| Cap unknown `reasoning_effort` | n/a | New values like `xhigh` clamped to per-model cap instead of 400ing |
 
 ## Features
 
