@@ -57,6 +57,8 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy cla
 
 The proxy runs with `restart: always` — it stays running across reboots.
 
+**Securing a public deployment:** if you expose the proxy beyond localhost, copy `.env.example` to `.env` and set `COPILOT_PROXY_API_KEY` to a long random secret. `docker compose` picks it up automatically; clients must send the same value as `ANTHROPIC_AUTH_TOKEN`. Without this, any caller can use your Copilot quota.
+
 ### 3. Select your model
 
 Inside Claude Code, use `/model` to switch between available models. The list is pulled live from your Copilot subscription's `/models` endpoint (cached 1h) — whatever Claude variants Copilot has rolled out to your account will appear automatically.
