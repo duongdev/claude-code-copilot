@@ -158,7 +158,7 @@ The proxy exposes `GET /v1/copilot/usage` which returns your current GitHub Copi
 
 ```bash
 curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .overage_cost_usd, .projected_overage_cost_usd'
-# "Copilot business · premium: 1200/300 (overage: 400% · $48.00 · billable) · resets 2026-01-01"
+# "Copilot business · premium: 1500/300 (500% · $48.00 · billable) · resets 2026-01-01"
 # 48.00
 # 72.00
 ```

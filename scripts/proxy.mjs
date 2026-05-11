@@ -669,10 +669,12 @@ function fmtUSD(n) {
 }
 
 // Friendly one-line summary for human display (statusline, slash command, etc).
-// When over quota, headline the overage count as a percentage of entitlement
-// AND the actual dollar cost so the magnitude of the breach is immediately
-// visible in both relative and absolute terms:
-//   "premium: 1200/300 (overage: 400% · $48.00 · billable)"
+// When over quota, headline the percent of total quota consumed (matching
+// GitHub's dashboard formula: (overage + entitlement) / entitlement × 100 —
+// 100% = at quota, anything higher = over) plus the dollar cost so the
+// magnitude of the breach is immediately visible in both relative and absolute
+// terms:
+//   "premium: 1500/300 (500% · $48.00 · billable)"
 // Under quota, show the conventional used/entitlement with no cost suffix.
 function summarizeUsage(u) {
   const plan = u?.copilot_plan || "unknown"
@@ -683,14 +685,14 @@ function summarizeUsage(u) {
   const entitlement = pi.entitlement || 0
   let premiumLine
   if (pi.remaining < 0 && entitlement > 0) {
-    const overage = -pi.remaining
-    const pct = Math.round((overage / entitlement) * 100)
+    const used = entitlement - pi.remaining // remaining is negative here
+    const pct = Math.round((used / entitlement) * 100)
     const billable = pi.overage_permitted ? "billable" : "blocked"
     const cost = computeOverageCost(pi)
     // Only show cost when billable — when blocked, no money is owed so the
     // dollar figure is misleading.
     const costSuffix = pi.overage_permitted ? ` · ${fmtUSD(cost)}` : ""
-    premiumLine = `premium: ${overage}/${entitlement} (overage: ${pct}%${costSuffix} · ${billable})`
+    premiumLine = `premium: ${used}/${entitlement} (${pct}%${costSuffix} · ${billable})`
   } else {
     const used = entitlement - Math.max(0, pi.remaining)
     premiumLine = `premium: ${used}/${entitlement}`

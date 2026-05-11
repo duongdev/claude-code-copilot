@@ -31,14 +31,14 @@ Show the user their current GitHub Copilot usage and quota.
 4. Format example (when over quota):
    ```
    GitHub Copilot · business plan
-   Premium requests: 1200 / 300 (overage: 400% · $48.00 · billable)
+   Premium requests: 1500 / 300 (500% · $48.00 · billable)
    Projected month-end: ~$72.00
    Chat / completions: unlimited
    Resets: 2026-01-01
    Org: your-org
    ```
 
-   When over quota: numerator is overage count, denominator is entitlement, `X%` is `(overage / entitlement) × 100`, dollar figure is `overage_cost_usd`. Append `· billable` when `overage_permitted` is true, `· blocked` (no dollar figure) when false. Show the projected line only when `projected_overage_cost_usd` is present and greater than the current cost. When under quota, just show `{used} / {entitlement}` with no overage / cost suffix.
+   When over quota: numerator is total used (entitlement + overage), denominator is entitlement, `X%` is `(used / entitlement) × 100` — matching GitHub's dashboard, where 100% = at quota and anything higher = over. Dollar figure is `overage_cost_usd`. Append `· billable` when `overage_permitted` is true, `· blocked` (no dollar figure) when false. Show the projected line only when `projected_overage_cost_usd` is present and greater than the current cost. When under quota, just show `{used} / {entitlement}` with no percent / cost suffix.
 
 5. If the proxy returns 502 or the request fails, the proxy is likely not running or the OAuth token expired. Suggest:
    - Check the proxy is up: `curl "$ANTHROPIC_BASE_URL/health"`
