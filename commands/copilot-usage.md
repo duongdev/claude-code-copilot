@@ -1,18 +1,21 @@
 ---
 description: Show GitHub Copilot quota and usage (premium requests, plan, reset date)
 allowed-tools: Bash
+model: haiku
 ---
 
 Show the user their current GitHub Copilot usage and quota.
 
-1. Determine the proxy base URL (default `http://localhost:18080` unless the user has set `ANTHROPIC_BASE_URL` to point at the Copilot proxy).
+1. Use `ANTHROPIC_BASE_URL` as the proxy base — Claude Code already has it set to the Copilot proxy (may be `http://localhost:18080` for a local proxy or a remote URL like `https://clproxy.example.com`). Do not hardcode localhost.
 
-2. Fetch the usage endpoint. Claude Code already has `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`) set to talk to the proxy — reuse whichever is present as `x-api-key`. The proxy treats `ANTHROPIC_AUTH_TOKEN`'s value as the shared secret when `COPILOT_PROXY_API_KEY` is enforced; if it isn't enforced, any value passes (or no header at all).
+2. Fetch the usage endpoint. Claude Code already has `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`) set — pass it as a `Authorization: Bearer` header. The proxy treats that value as the shared secret when `COPILOT_PROXY_API_KEY` is enforced; if it isn't enforced, any value passes (or no header at all).
    ```bash
    key="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}"
-   curl -s "${ANTHROPIC_BASE_URL:-http://localhost:18080}/v1/copilot/usage" \
-     ${key:+-H "x-api-key: $key"}
+   curl -s "$ANTHROPIC_BASE_URL/v1/copilot/usage" \
+     -H "Authorization: Bearer ${key}"
    ```
+
+   Note: do NOT wrap the `-H` flag inside a `${var:+...}` expansion — quotes inside that expansion are literal characters, and word-splitting will mangle the header so the proxy sees an invalid bearer. Always pass the header directly; the proxy ignores it when `COPILOT_PROXY_API_KEY` isn't enforced.
 
 3. Parse the JSON response and present a concise summary. The most useful fields:
    - `summary` — one-line human-readable summary (use this as the headline)
@@ -38,7 +41,7 @@ Show the user their current GitHub Copilot usage and quota.
    When over quota: numerator is overage count, denominator is entitlement, `X%` is `(overage / entitlement) × 100`, dollar figure is `overage_cost_usd`. Append `· billable` when `overage_permitted` is true, `· blocked` (no dollar figure) when false. Show the projected line only when `projected_overage_cost_usd` is present and greater than the current cost. When under quota, just show `{used} / {entitlement}` with no overage / cost suffix.
 
 5. If the proxy returns 502 or the request fails, the proxy is likely not running or the OAuth token expired. Suggest:
-   - Check the proxy is up: `curl http://localhost:18080/health`
+   - Check the proxy is up: `curl "$ANTHROPIC_BASE_URL/health"`
    - Re-authenticate: `node scripts/auth.mjs`
 
 Be concise — usually the user just wants the summary line plus the reset date.
