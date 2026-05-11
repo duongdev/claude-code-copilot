@@ -1156,10 +1156,15 @@ async function handleRequest(req, res, token) {
     }
     const requested = ccdEffort || "high"
     const max = cap[copilotModel]
-    // Pick the lower of requested vs cap
-    const order = { low: 1, medium: 2, high: 3 }
+    // Pick the lower of requested vs cap. Unknown values (e.g. "xhigh" from
+    // newer Claude Code builds) are treated as higher than any known rank so
+    // the cap forces them down — Copilot otherwise 400s with
+    // `invalid_reasoning_effort`.
+    const order = { low: 1, medium: 2, high: 3, xhigh: 4 }
+    const requestedRank = order[requested] ?? Infinity
+    const maxRank = order[max] ?? Infinity
     openaiReq.reasoning_effort =
-      max && order[requested] > order[max] ? max : requested
+      max && requestedRank > maxRank ? max : requested
   }
 
   if (anthropicReq.temperature !== undefined) {
