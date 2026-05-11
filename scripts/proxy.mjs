@@ -1449,9 +1449,13 @@ async function handleRequest(req, res, token) {
   // Handle messages endpoint - match any path ending in /messages or containing messages
   const isMessagesEndpoint = url.includes("/messages")
 
-  // Handle token counting / tokenizer endpoints - Claude Code calls this
+  // Handle token counting / tokenizer endpoints - Claude Code calls this to
+  // populate the context-window meter. MUST include `tools` in the estimate:
+  // with MCP servers loaded, tool schemas often dwarf the message payload
+  // (20–50K tokens of JSON), and omitting them causes the meter to freeze at a
+  // misleadingly low percentage. Use the same CHARS_PER_TOKEN constant the
+  // rest of the proxy uses so all our estimates stay consistent.
   if (url.includes("/count_tokens") || url.includes("/token")) {
-    // Read body to get token count request for accurate-ish estimation
     let body = ""
     for await (const chunk of req) {
       body += chunk
@@ -1459,9 +1463,11 @@ async function handleRequest(req, res, token) {
     let inputTokens = 0
     try {
       const data = JSON.parse(body)
-      // Rough estimation: ~4 chars per token
-      const text = JSON.stringify(data.messages || []) + JSON.stringify(data.system || "")
-      inputTokens = Math.ceil(text.length / 4)
+      const text =
+        JSON.stringify(data.messages || []) +
+        JSON.stringify(data.system || "") +
+        JSON.stringify(data.tools || [])
+      inputTokens = Math.ceil(text.length / CHARS_PER_TOKEN)
     } catch {}
     console.log(`  ⚡ Token count → ~${inputTokens} tokens (estimated)`)
     res.writeHead(200, { "Content-Type": "application/json" })
