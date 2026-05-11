@@ -57,7 +57,7 @@ cd claude-code-copilot
 node scripts/auth.mjs
 ```
 
-The auth script opens a GitHub device code flow in your browser. Your token is saved to `~/.claude-copilot-auth.json`.
+The auth script opens a GitHub device code flow in your browser. Your token is saved to `.config/auth.json` inside the repo (legacy `~/.claude-copilot-auth.json` is honored if it already exists).
 
 ### 2. Start Claude Code
 
@@ -118,9 +118,15 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy cla
 
 ## Configuration
 
-All settings can be passed as environment variables or as keys in a JSON config file at `~/.claude-copilot-config.json` (lowercase, no `COPILOT_` prefix). Precedence: **env var > config file > built-in default**.
+All settings can be passed as environment variables or as keys in a JSON config file. Precedence: **env var > config file > built-in default**.
 
-A full template is in [`.claude-copilot-config.example.json`](.claude-copilot-config.example.json) — copy it to `~/.claude-copilot-config.json`, delete the `_comment` key, edit to taste.
+**Config file lookup order:**
+
+1. `$COPILOT_CONFIG_FILE` if set
+2. `./.config/config.json` (repo-local — the recommended location, mounted into the Docker container automatically)
+3. `~/.claude-copilot-config.json` (legacy, kept for back-compat)
+
+A full template is in [`.config/config.example.json`](.config/config.example.json) — copy it to `.config/config.json`, delete the `_comment` key, edit to taste. The auth token follows the same lookup (`.config/auth.json` first, falling back to `~/.claude-copilot-auth.json`).
 
 ```json
 {
@@ -134,7 +140,7 @@ A full template is in [`.claude-copilot-config.example.json`](.claude-copilot-co
 | Variable | Config key | Default | Description |
 |---|---|---|---|
 | `COPILOT_PROXY_PORT` | `proxy_port` | `18080` | Port for the local proxy |
-| `COPILOT_AUTH_FILE` | `auth_file` | `~/.claude-copilot-auth.json` | Path to saved OAuth token |
+| `COPILOT_AUTH_FILE` | `auth_file` | `.config/auth.json` *(repo)* → `~/.claude-copilot-auth.json` *(legacy)* | Path to saved OAuth token |
 | `COPILOT_PROXY_API_KEY` | `proxy_api_key` | *(none)* | Shared secret required from clients; leave unset for loopback-only |
 | `COPILOT_MAX_PROMPT_TOKENS` | `max_prompt_tokens` | `115000` | Compaction target (Copilot's hard cap is 128K) |
 | `COPILOT_TOOL_RESULT_MAX_CHARS` | `tool_result_max_chars` | `25000` | Max chars per tool_result block before truncation |
@@ -142,7 +148,7 @@ A full template is in [`.claude-copilot-config.example.json`](.claude-copilot-co
 | `COPILOT_DEFAULT_MAX_OUTPUT` | `default_max_output` | *(model-aware)* | Override per-model `max_tokens` default |
 | `BRAVE_API_KEY` | `brave_api_key` | *(none)* | Brave Search API key for web search |
 | `WEB_SEARCH_MAX_RESULTS` | `web_search_max_results` | `5` | Max search results per query |
-| `COPILOT_CONFIG_FILE` | — | `~/.claude-copilot-config.json` | Override config file path |
+| `COPILOT_CONFIG_FILE` | — | *(see lookup order above)* | Override config file path |
 
 ## License
 

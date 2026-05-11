@@ -16,12 +16,24 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-// Optional JSON config at ~/.claude-copilot-config.json. Keys match env var
-// names lowercased with the COPILOT_ prefix stripped. Precedence:
-//   env var > config file > built-in default.
+// Optional JSON config file. Lookup order:
+//   1. $COPILOT_CONFIG_FILE if set
+//   2. ./.config/config.json (relative to cwd — works for repo-local + Docker
+//      bind-mount of /app/.config)
+//   3. ~/.claude-copilot-config.json (legacy location, kept for back-compat)
+// Same lookup applies to the auth token file (auth.json / .claude-copilot-auth.json).
+// Keys match env var names lowercased with the COPILOT_ prefix stripped.
+// Precedence: env var > config file > built-in default.
 // File is read once at startup; malformed JSON is logged and ignored (we
 // fall back to env-only so a typo never bricks the proxy).
-const CONFIG_PATH = process.env.COPILOT_CONFIG_FILE || join(homedir(), ".claude-copilot-config.json")
+function defaultConfigLocation(repoRelative, legacyHomeFile) {
+  const repoLocal = join(process.cwd(), ".config", repoRelative)
+  if (existsSync(repoLocal)) return repoLocal
+  return join(homedir(), legacyHomeFile)
+}
+const CONFIG_PATH =
+  process.env.COPILOT_CONFIG_FILE ||
+  defaultConfigLocation("config.json", ".claude-copilot-config.json")
 let FILE_CONFIG = {}
 try {
   if (existsSync(CONFIG_PATH)) {
@@ -51,7 +63,7 @@ const PORT = cfgInt("COPILOT_PROXY_PORT", "proxy_port", 18080)
 const AUTH_FILE = cfgString(
   "COPILOT_AUTH_FILE",
   "auth_file",
-  join(homedir(), ".claude-copilot-auth.json")
+  defaultConfigLocation("auth.json", ".claude-copilot-auth.json")
 )
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"

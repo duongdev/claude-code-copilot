@@ -10,9 +10,9 @@ Help the user set up the GitHub Copilot provider for Claude Code. Follow these s
    ls ${CLAUDE_PLUGIN_ROOT}/../github-copilot-provider/scripts/
    ```
 
-2. Check if the user is already authenticated:
+2. Check if the user is already authenticated (checks repo-local `.config/auth.json` first, then legacy `~/.claude-copilot-auth.json`):
    ```
-   cat ~/.claude-copilot-auth.json 2>/dev/null
+   cat ${CLAUDE_PLUGIN_ROOT}/../github-copilot-provider/.config/auth.json 2>/dev/null || cat ~/.claude-copilot-auth.json 2>/dev/null
    ```
 
 3. If not authenticated, tell the user to run in a separate terminal:

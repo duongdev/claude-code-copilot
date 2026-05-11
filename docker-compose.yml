@@ -6,10 +6,10 @@ services:
     ports:
       - "18080:18080"
     volumes:
-      - ~/.claude-copilot-auth.json:/root/.claude-copilot-auth.json:ro
-      # Optional: mount a config file if you keep one. Uncomment AFTER you've
-      # created the file — Docker will create an empty directory otherwise.
-      # - ~/.claude-copilot-config.json:/root/.claude-copilot-config.json:ro
+      # Bind-mount the repo-local .config/ into the container so auth.json
+      # and config.json are read at runtime. Read-write so `node scripts/auth.mjs`
+      # (when run inside the container) can write the token back.
+      - ./.config:/app/.config
     environment:
       - COPILOT_PROXY_PORT=18080
       - BRAVE_API_KEY=${BRAVE_API_KEY:-}
