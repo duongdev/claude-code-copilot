@@ -12,6 +12,11 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, dirname } from "node:path"
 
+// Public OAuth client ID for the VS Code GitHub Copilot extension. Intentionally
+// shared — this same value is hardcoded in VS Code, OpenCode, Aider, and every
+// other Copilot client. GitHub only allows a whitelist of Microsoft/GitHub-owned
+// apps to call api.githubcopilot.com, so reusing this ID is the only path for
+// unofficial clients. Not a secret; the per-user access token is what matters.
 const CLIENT_ID = "Ov23li8tweQw6odWQebz"
 const DEVICE_CODE_URL = "https://github.com/login/device/code"
 const ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"

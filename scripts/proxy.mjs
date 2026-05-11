@@ -572,6 +572,56 @@ async function fetchCopilotModels(token) {
   }
 }
 
+// ─── Copilot Usage / Quota ──────────────────────────────────────────────────
+// GitHub's undocumented /copilot_internal/user endpoint returns the same payload
+// VS Code's Copilot extension fetches: plan tier, quota snapshots (chat,
+// completions, premium_interactions), reset date, and per-org endpoints. It's
+// "internal" — shape can change without notice — but it's also what every
+// third-party Copilot dashboard (Copilot Insights, etc.) relies on, so it's
+// been stable in practice.
+//
+// We cache for 5 minutes: long enough to absorb a CC statusline refresh loop,
+// short enough that "remaining" feels live after a heavy session.
+const USAGE_CACHE_TTL_MS = 5 * 60 * 1000
+let usageCache = { fetchedAt: 0, payload: null }
+async function fetchCopilotUsage(githubOAuthToken) {
+  const now = Date.now()
+  if (usageCache.payload && now - usageCache.fetchedAt < USAGE_CACHE_TTL_MS) {
+    return usageCache.payload
+  }
+  const res = await fetch("https://api.github.com/copilot_internal/user", {
+    headers: {
+      // /copilot_internal/user takes the GitHub OAuth token directly (the same
+      // gho_* token stored in auth.json), NOT the Copilot bearer used for
+      // api.githubcopilot.com calls. Editor-Version is required — without it
+      // the endpoint returns 404.
+      Authorization: `token ${githubOAuthToken}`,
+      "Editor-Version": "vscode/1.95.0",
+      "User-Agent": USER_AGENT,
+    },
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+  }
+  const data = await res.json()
+  usageCache = { fetchedAt: now, payload: data }
+  return data
+}
+
+// Friendly one-line summary for human display (statusline, slash command, etc).
+function summarizeUsage(u) {
+  const plan = u?.copilot_plan || "unknown"
+  const pi = u?.quota_snapshots?.premium_interactions
+  const resetDate = (u?.quota_reset_date || "").slice(0, 10)
+  if (!pi) return `Copilot ${plan} · no premium quota data`
+  if (pi.unlimited) return `Copilot ${plan} · premium: unlimited · resets ${resetDate}`
+  const used = (pi.entitlement || 0) - Math.max(0, pi.remaining)
+  const overage = pi.remaining < 0 ? ` (overage: ${-pi.remaining})` : ""
+  return `Copilot ${plan} · premium: ${used}/${pi.entitlement}${overage} · resets ${resetDate}`
+}
+
+
 
 /**
  * Collect a full non-streaming response from Copilot.
@@ -1402,6 +1452,28 @@ async function handleRequest(req, res, token) {
     console.log(`  ⚡ Token count → ~${inputTokens} tokens (estimated)`)
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({ input_tokens: inputTokens }))
+    return
+  }
+
+  // Copilot usage / quota — calls GitHub's internal /copilot_internal/user
+  // endpoint with the stored OAuth token and returns the raw payload plus a
+  // human-readable `summary` string. Cached 5 minutes. Behind the API key gate
+  // like everything else (the upstream payload includes org/email info).
+  if (url.startsWith("/v1/copilot/usage")) {
+    try {
+      const data = await fetchCopilotUsage(token)
+      const out = { summary: summarizeUsage(data), ...data }
+      console.log(`  ⚡ Usage → ${out.summary}`)
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify(out, null, 2))
+    } catch (err) {
+      console.warn(`  ⚠ Usage fetch failed: ${err.message}`)
+      res.writeHead(502, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({
+        type: "error",
+        error: { type: "api_error", message: `Failed to fetch Copilot usage: ${err.message}` },
+      }))
+    }
     return
   }
 

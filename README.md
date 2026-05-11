@@ -30,6 +30,7 @@ This project runs a lightweight local proxy that translates between Anthropic's 
 | Configuration | Env vars only | Env vars + optional `~/.claude-copilot-config.json` (env > file > default) |
 | `cache_control` blocks | Passed through (Copilot rejects) | Stripped before forwarding |
 | Cap unknown `reasoning_effort` | n/a | New values like `xhigh` clamped to per-model cap instead of 400ing |
+| Copilot quota visibility | None | `GET /v1/copilot/usage` returns plan + premium-request quota + reset date (proxies GitHub's `/copilot_internal/user`); includes `/copilot-usage` slash command for Claude Code |
 
 ## Features
 
@@ -149,6 +150,20 @@ A full template is in [`.config/config.example.json`](.config/config.example.jso
 | `BRAVE_API_KEY` | `brave_api_key` | *(none)* | Brave Search API key for web search |
 | `WEB_SEARCH_MAX_RESULTS` | `web_search_max_results` | `5` | Max search results per query |
 | `COPILOT_CONFIG_FILE` | — | *(see lookup order above)* | Override config file path |
+
+## Checking your Copilot quota
+
+The proxy exposes `GET /v1/copilot/usage` which returns your current GitHub Copilot plan, premium-request entitlement, remaining quota, and reset date. It proxies GitHub's undocumented `/copilot_internal/user` endpoint (the same one VS Code's Copilot extension uses) and caches for 5 minutes.
+
+```bash
+curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .quota_snapshots.premium_interactions'
+# "Copilot business · premium: 300/300 (overage: 900) · resets 2026-01-01"
+# { "entitlement": 300, "remaining": -900, "overage_permitted": true, ... }
+```
+
+If `COPILOT_PROXY_API_KEY` is set, pass it as `x-api-key` or `Authorization: Bearer ...`.
+
+**Slash command for Claude Code.** Copy [`commands/copilot-usage.md`](commands/copilot-usage.md) into your CC commands directory (e.g. `~/.claude/commands/` or any plugin's `commands/` dir), then `/copilot-usage` inside Claude Code prints a formatted summary.
 
 ## License
 
