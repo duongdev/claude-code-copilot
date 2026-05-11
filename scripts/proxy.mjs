@@ -1468,8 +1468,24 @@ async function handleRequest(req, res, token) {
   const url = req.url || ""
   const method = req.method || "GET"
 
+  // Parse query string once; used for query-string auth fallback below.
+  // Strip the api_key param from the logged URL so secrets don't end up in logs.
+  let queryApiKey = ""
+  let loggedUrl = url
+  const qIdx = url.indexOf("?")
+  if (qIdx !== -1) {
+    const params = new URLSearchParams(url.slice(qIdx + 1))
+    queryApiKey = params.get("api_key") || params.get("key") || ""
+    if (queryApiKey) {
+      params.delete("api_key")
+      params.delete("key")
+      const rest = params.toString()
+      loggedUrl = url.slice(0, qIdx) + (rest ? `?${rest}` : "") + " (api_key=***)"
+    }
+  }
+
   // Log every request for debugging
-  console.log(`[${new Date().toISOString()}] ${method} ${url}`)
+  console.log(`[${new Date().toISOString()}] ${method} ${loggedUrl}`)
 
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*")
@@ -1490,11 +1506,14 @@ async function handleRequest(req, res, token) {
   }
 
   // Optional shared-secret check. Set COPILOT_PROXY_API_KEY to enforce it;
-  // leave unset for loopback-only deployments.
+  // leave unset for loopback-only deployments. Accepts the secret via header
+  // (x-api-key / Authorization: Bearer) or — as a fallback for browsers and
+  // anything that can't set headers — `?api_key=` / `?key=` on the query string.
   if (PROXY_API_KEY) {
     const provided =
       req.headers["x-api-key"] ||
       req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
+      queryApiKey ||
       ""
     if (provided !== PROXY_API_KEY) {
       console.log(`  ✗ Rejected: invalid API key`)
