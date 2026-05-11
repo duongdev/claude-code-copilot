@@ -610,15 +610,29 @@ async function fetchCopilotUsage(githubOAuthToken) {
 }
 
 // Friendly one-line summary for human display (statusline, slash command, etc).
+// When over quota, headline the overage count as a percentage of entitlement:
+//   "premium: 1200/300 (overage: 400% · billable)"
+// — the numerator is the overage, not total consumption, so the magnitude of
+// the breach is immediately visible. Under quota, show the conventional
+// used/entitlement.
 function summarizeUsage(u) {
   const plan = u?.copilot_plan || "unknown"
   const pi = u?.quota_snapshots?.premium_interactions
   const resetDate = (u?.quota_reset_date || "").slice(0, 10)
   if (!pi) return `Copilot ${plan} · no premium quota data`
   if (pi.unlimited) return `Copilot ${plan} · premium: unlimited · resets ${resetDate}`
-  const used = (pi.entitlement || 0) - Math.max(0, pi.remaining)
-  const overage = pi.remaining < 0 ? ` (overage: ${-pi.remaining})` : ""
-  return `Copilot ${plan} · premium: ${used}/${pi.entitlement}${overage} · resets ${resetDate}`
+  const entitlement = pi.entitlement || 0
+  let premiumLine
+  if (pi.remaining < 0 && entitlement > 0) {
+    const overage = -pi.remaining
+    const pct = Math.round((overage / entitlement) * 100)
+    const billable = pi.overage_permitted ? "billable" : "blocked"
+    premiumLine = `premium: ${overage}/${entitlement} (overage: ${pct}% · ${billable})`
+  } else {
+    const used = entitlement - Math.max(0, pi.remaining)
+    premiumLine = `premium: ${used}/${entitlement}`
+  }
+  return `Copilot ${plan} · ${premiumLine} · resets ${resetDate}`
 }
 
 

@@ -157,8 +157,8 @@ The proxy exposes `GET /v1/copilot/usage` which returns your current GitHub Copi
 
 ```bash
 curl -s http://localhost:18080/v1/copilot/usage | jq '.summary, .quota_snapshots.premium_interactions'
-# "Copilot business · premium: 300/300 (overage: 900) · resets 2026-01-01"
-# { "entitlement": 300, "remaining": -900, "overage_permitted": true, ... }
+# "Copilot business · premium: 1200/300 (overage: 400% · billable) · resets 2026-01-01"
+# { "entitlement": 300, "remaining": -1200, "overage_permitted": true, ... }
 ```
 
 If `COPILOT_PROXY_API_KEY` is set, pass it as `x-api-key` or `Authorization: Bearer ...`.

@@ -21,14 +21,16 @@ Show the user their current GitHub Copilot usage and quota.
    - `quota_reset_date` — when premium counter rolls over (YYYY-MM-DD)
    - `organization_list` — which orgs are paying for the seat (if any)
 
-4. Format example:
+4. Format example (when over quota):
    ```
    GitHub Copilot · business plan
-   Premium requests: 300 / 300 (overage: 900 · billable)
+   Premium requests: 1200 / 300 (overage: 400% · billable)
    Chat / completions: unlimited
    Resets: 2026-01-01
    Org: your-org
    ```
+
+   When over quota, show overage count as numerator and entitlement as denominator — the "X%" is `(overage / entitlement) × 100`. Append `· billable` when `overage_permitted` is true, `· blocked` when false. When under quota, just show `{used} / {entitlement}` with no overage suffix.
 
 5. If the proxy returns 502 or the request fails, the proxy is likely not running or the OAuth token expired. Suggest:
    - Check the proxy is up: `curl http://localhost:18080/health`
