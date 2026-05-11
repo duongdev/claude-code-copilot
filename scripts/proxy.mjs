@@ -29,6 +29,7 @@ const MAX_PROMPT_TOKENS = parseInt(process.env.COPILOT_MAX_PROMPT_TOKENS || "115
 const TOOL_RESULT_MAX_CHARS = parseInt(process.env.COPILOT_TOOL_RESULT_MAX_CHARS || "25000", 10)
 const KEEP_RECENT_TOOL_RESULTS = parseInt(process.env.COPILOT_KEEP_RECENT_TOOL_RESULTS || "2", 10)
 const CHARS_PER_TOKEN = 3.5
+const PROXY_API_KEY = process.env.COPILOT_PROXY_API_KEY || ""
 
 // ─── Context Compaction ──────────────────────────────────────────────────────
 
@@ -996,11 +997,31 @@ async function handleRequest(req, res, token) {
     return
   }
 
-  // Health check
+  // Health check (unauthenticated for liveness probes)
   if (url === "/health" || url === "/") {
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({ status: "ok", provider: "github-copilot" }))
     return
+  }
+
+  // Optional shared-secret check. Set COPILOT_PROXY_API_KEY to enforce it;
+  // leave unset for loopback-only deployments.
+  if (PROXY_API_KEY) {
+    const provided =
+      req.headers["x-api-key"] ||
+      req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
+      ""
+    if (provided !== PROXY_API_KEY) {
+      console.log(`  ✗ Rejected: invalid API key`)
+      res.writeHead(401, { "Content-Type": "application/json" })
+      res.end(
+        JSON.stringify({
+          type: "error",
+          error: { type: "authentication_error", message: "Invalid API key" },
+        })
+      )
+      return
+    }
   }
 
   // Handle messages endpoint - match any path ending in /messages or containing messages
@@ -1510,10 +1531,15 @@ server.listen(PORT, () => {
     console.log("  🔍 Web Search: DuckDuckGo Lite (free, no API key)")
     console.log("     For better results, set BRAVE_API_KEY (free at https://api.search.brave.com/)")
   }
+  if (PROXY_API_KEY) {
+    console.log(`  🔒 API key enforcement: ON (set COPILOT_PROXY_API_KEY)`)
+  } else {
+    console.log(`  🔓 API key enforcement: OFF (any key accepted — set COPILOT_PROXY_API_KEY to enforce)`)
+  }
   console.log()
   console.log("  Use Claude Code with:")
   console.log(
-    `  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=copilot-proxy claude`
+    `  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=${PROXY_API_KEY || "copilot-proxy"} claude`
   )
   console.log()
   console.log("  Press Ctrl+C to stop")
