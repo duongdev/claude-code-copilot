@@ -52,7 +52,7 @@ This project runs a lightweight local proxy that translates between Anthropic's 
 
 ### 1. Clone and authenticate
 ```bash
-git clone https://github.com/samarth777/claude-code-copilot.git
+git clone https://github.com/duongdev/claude-code-copilot.git
 cd claude-code-copilot
 node scripts/auth.mjs
 ```
