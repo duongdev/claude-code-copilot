@@ -15,6 +15,10 @@ This project runs a lightweight local proxy that translates between Anthropic's 
 ## Features
 
 - **Full API Translation** — Anthropic Messages API ↔ OpenAI Chat Completions, including streaming
+- **Live Model Catalog** — `/v1/models` proxies GitHub Copilot's real model list (cached 1h) so new Claude rollouts appear without a proxy update
+- **Extended Thinking** — Forwards `reasoning_content` from Opus 4.7 as Anthropic `thinking` blocks
+- **Long Outputs** — Per-model `max_tokens` defaults (16K for Opus/Sonnet 4.6+, 8K for Haiku/Sonnet 4.5)
+- **Resilient** — Automatic retries on 429/503 with `Retry-After`, aggressive recompaction on prompt overflow, SSE keepalive pings
 - **Web Search** — Emulates Anthropic's `web_search_20250305` tool using DuckDuckGo Lite (free) or Brave Search API
 - **Docker Support** — Run the proxy as an always-on container that survives reboots
 - **Zero Dependencies** — Pure Node.js, no npm install needed
@@ -48,14 +52,14 @@ This auto-starts the proxy (via Docker if available, otherwise as a background p
 **Or use Docker directly:**
 ```bash
 docker compose up -d
-ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy claude
 ```
 
 The proxy runs with `restart: always` — it stays running across reboots.
 
 ### 3. Select your model
 
-Inside Claude Code, use `/model` to switch between available models (Claude Opus, Sonnet, etc.).
+Inside Claude Code, use `/model` to switch between available models. The list is pulled live from your Copilot subscription's `/models` endpoint (cached 1h) — whatever Claude variants Copilot has rolled out to your account will appear automatically.
 
 ## Web Search
 
@@ -86,17 +90,36 @@ lsof -ti:18080 | xargs kill -9
 
 Make sure both environment variables are set:
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy claude
 ```
+
+> Use `ANTHROPIC_AUTH_TOKEN` rather than `ANTHROPIC_API_KEY` — the latter triggers a conflict warning in Claude Code when a Pro/Max plan is signed in.
 
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `COPILOT_PROXY_PORT` | `18080` | Port for the local proxy |
-| `COPILOT_AUTH_FILE` | `~/.claude-copilot-auth.json` | Path to saved OAuth token |
-| `BRAVE_API_KEY` | *(none)* | Brave Search API key for web search |
-| `WEB_SEARCH_MAX_RESULTS` | `5` | Max search results per query |
+All settings can be passed as environment variables or as keys in a JSON config file at `~/.claude-copilot-config.json` (lowercase, no `COPILOT_` prefix). Precedence: **env var > config file > built-in default**.
+
+```json
+{
+  "max_prompt_tokens": 100000,
+  "tool_result_max_chars": 25000,
+  "default_max_output": 16384,
+  "brave_api_key": "..."
+}
+```
+
+| Variable | Config key | Default | Description |
+|---|---|---|---|
+| `COPILOT_PROXY_PORT` | `proxy_port` | `18080` | Port for the local proxy |
+| `COPILOT_AUTH_FILE` | `auth_file` | `~/.claude-copilot-auth.json` | Path to saved OAuth token |
+| `COPILOT_PROXY_API_KEY` | `proxy_api_key` | *(none)* | Shared secret required from clients; leave unset for loopback-only |
+| `COPILOT_MAX_PROMPT_TOKENS` | `max_prompt_tokens` | `115000` | Compaction target (Copilot's hard cap is 128K) |
+| `COPILOT_TOOL_RESULT_MAX_CHARS` | `tool_result_max_chars` | `25000` | Max chars per tool_result block before truncation |
+| `COPILOT_KEEP_RECENT_TOOL_RESULTS` | `keep_recent_tool_results` | `2` | Never-truncate this many most-recent tool results |
+| `COPILOT_DEFAULT_MAX_OUTPUT` | `default_max_output` | *(model-aware)* | Override per-model `max_tokens` default |
+| `BRAVE_API_KEY` | `brave_api_key` | *(none)* | Brave Search API key for web search |
+| `WEB_SEARCH_MAX_RESULTS` | `web_search_max_results` | `5` | Max search results per query |
+| `COPILOT_CONFIG_FILE` | — | `~/.claude-copilot-config.json` | Override config file path |
 
 ## License
 

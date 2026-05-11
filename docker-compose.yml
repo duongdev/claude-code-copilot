@@ -7,6 +7,9 @@ services:
       - "18080:18080"
     volumes:
       - ~/.claude-copilot-auth.json:/root/.claude-copilot-auth.json:ro
+      # Optional: mount a config file if you keep one. Uncomment AFTER you've
+      # created the file — Docker will create an empty directory otherwise.
+      # - ~/.claude-copilot-config.json:/root/.claude-copilot-config.json:ro
     environment:
       - COPILOT_PROXY_PORT=18080
       - BRAVE_API_KEY=${BRAVE_API_KEY:-}
@@ -15,3 +18,4 @@ services:
       - COPILOT_MAX_PROMPT_TOKENS=${COPILOT_MAX_PROMPT_TOKENS:-115000}
       - COPILOT_TOOL_RESULT_MAX_CHARS=${COPILOT_TOOL_RESULT_MAX_CHARS:-25000}
       - COPILOT_KEEP_RECENT_TOOL_RESULTS=${COPILOT_KEEP_RECENT_TOOL_RESULTS:-2}
+      - COPILOT_DEFAULT_MAX_OUTPUT=${COPILOT_DEFAULT_MAX_OUTPUT:-}

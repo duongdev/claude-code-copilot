@@ -206,7 +206,7 @@ async function main() {
   console.log()
   console.log("Then run Claude Code with:")
   console.log(
-    "  ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude"
+    "  ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_AUTH_TOKEN=copilot-proxy claude"
   )
 }
 

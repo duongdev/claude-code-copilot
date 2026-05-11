@@ -15,38 +15,135 @@ import { readFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-const PORT = parseInt(process.env.COPILOT_PROXY_PORT || "18080", 10)
-const AUTH_FILE =
-  process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
+// ─── Config ──────────────────────────────────────────────────────────────────
+// Optional JSON config at ~/.claude-copilot-config.json. Keys match env var
+// names lowercased with the COPILOT_ prefix stripped. Precedence:
+//   env var > config file > built-in default.
+// File is read once at startup; malformed JSON is logged and ignored (we
+// fall back to env-only so a typo never bricks the proxy).
+const CONFIG_PATH = process.env.COPILOT_CONFIG_FILE || join(homedir(), ".claude-copilot-config.json")
+let FILE_CONFIG = {}
+try {
+  if (existsSync(CONFIG_PATH)) {
+    FILE_CONFIG = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) || {}
+    console.log(`✓ Loaded config from ${CONFIG_PATH}`)
+  }
+} catch (err) {
+  console.warn(`⚠ Ignoring malformed config at ${CONFIG_PATH}: ${err.message}`)
+  FILE_CONFIG = {}
+}
+function cfgString(envName, fileKey, fallback) {
+  if (process.env[envName] !== undefined && process.env[envName] !== "") {
+    return process.env[envName]
+  }
+  if (FILE_CONFIG[fileKey] !== undefined && FILE_CONFIG[fileKey] !== null) {
+    return String(FILE_CONFIG[fileKey])
+  }
+  return fallback
+}
+function cfgInt(envName, fileKey, fallback) {
+  const raw = cfgString(envName, fileKey, String(fallback))
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) ? n : fallback
+}
+
+const PORT = cfgInt("COPILOT_PROXY_PORT", "proxy_port", 18080)
+const AUTH_FILE = cfgString(
+  "COPILOT_AUTH_FILE",
+  "auth_file",
+  join(homedir(), ".claude-copilot-auth.json")
+)
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
-const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
-const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
+const BRAVE_API_KEY = cfgString("BRAVE_API_KEY", "brave_api_key", "")
+const WEB_SEARCH_MAX_RESULTS = cfgInt("WEB_SEARCH_MAX_RESULTS", "web_search_max_results", 5)
 
 // Copilot enforces a hard 128K input cap for Claude models regardless of the
 // model's native context window. Leave headroom for system prompt + tools.
-const MAX_PROMPT_TOKENS = parseInt(process.env.COPILOT_MAX_PROMPT_TOKENS || "115000", 10)
-const TOOL_RESULT_MAX_CHARS = parseInt(process.env.COPILOT_TOOL_RESULT_MAX_CHARS || "25000", 10)
-const KEEP_RECENT_TOOL_RESULTS = parseInt(process.env.COPILOT_KEEP_RECENT_TOOL_RESULTS || "2", 10)
-const CHARS_PER_TOKEN = 3.5
-const PROXY_API_KEY = process.env.COPILOT_PROXY_API_KEY || ""
+const MAX_PROMPT_TOKENS = cfgInt("COPILOT_MAX_PROMPT_TOKENS", "max_prompt_tokens", 115000)
+const TOOL_RESULT_MAX_CHARS = cfgInt("COPILOT_TOOL_RESULT_MAX_CHARS", "tool_result_max_chars", 25000)
+const KEEP_RECENT_TOOL_RESULTS = cfgInt("COPILOT_KEEP_RECENT_TOOL_RESULTS", "keep_recent_tool_results", 2)
+// JSON-heavy MCP payloads tokenize closer to ~3 chars/token. Optimistic
+// estimates here cause us to ship requests Copilot will then 400.
+const CHARS_PER_TOKEN = 3.0
+const PROXY_API_KEY = cfgString("COPILOT_PROXY_API_KEY", "proxy_api_key", "")
 
 // ─── Context Compaction ──────────────────────────────────────────────────────
 
-function truncateToolResultBlock(block) {
+// Map Copilot HTTP status → Anthropic error type. Mirrors the official
+// Anthropic API error vocabulary so Claude Code's retry/banner logic behaves
+// the way it would against api.anthropic.com.
+function anthropicErrorType(status) {
+  if (status === 401) return "authentication_error"
+  if (status === 403) return "permission_error"
+  if (status === 429) return "rate_limit_error"
+  if (status === 400) return "invalid_request_error"
+  if (status === 404) return "not_found_error"
+  if (status === 413) return "request_too_large"
+  if (status === 503) return "overloaded_error"
+  if (status >= 500) return "api_error"
+  return "api_error"
+}
+
+// Strip Anthropic `cache_control` markers from the request before forwarding.
+// Copilot ignores them; removing keeps payloads cleaner and avoids leaking
+// internal markers into Copilot logs.
+function stripCacheControl(req) {
+  if (!req || typeof req !== "object") return req
+  const clean = (parts) => {
+    if (!Array.isArray(parts)) return parts
+    return parts.map((p) => {
+      if (p && typeof p === "object" && "cache_control" in p) {
+        const { cache_control: _drop, ...rest } = p
+        return rest
+      }
+      return p
+    })
+  }
+  const out = { ...req }
+  if (Array.isArray(out.system)) out.system = clean(out.system)
+  if (Array.isArray(out.tools)) out.tools = clean(out.tools)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((msg) => {
+      if (!msg || !Array.isArray(msg.content)) return msg
+      return { ...msg, content: clean(msg.content) }
+    })
+  }
+  return out
+}
+
+// Parse tool-call arguments emitted by Copilot. Copilot occasionally ships
+// malformed JSON (truncated mid-stream, escaping bugs, etc.). We default to
+// `{}` to keep the conversation alive — the model usually self-corrects on
+// the next turn — but log enough context to debug recurring failures.
+function safeParseToolArgs(raw, toolName) {
+  if (!raw) return {}
+  if (typeof raw === "object") return raw
+  try {
+    return JSON.parse(raw)
+  } catch (err) {
+    const preview = String(raw).slice(0, 200).replace(/\n/g, "\\n")
+    console.warn(
+      `  ⚠ tool args parse failed: ${toolName || "<unknown>"} — ${err.message} | preview: ${preview}`
+    )
+    return {}
+  }
+}
+
+function truncateToolResultBlock(block, maxChars = TOOL_RESULT_MAX_CHARS) {
   const tag = (n) => `\n\n…[truncated ${n} chars by proxy to fit Copilot's 128K prompt cap]`
   if (typeof block.content === "string") {
-    if (block.content.length <= TOOL_RESULT_MAX_CHARS) return block
-    const cut = block.content.length - TOOL_RESULT_MAX_CHARS
-    return { ...block, content: block.content.slice(0, TOOL_RESULT_MAX_CHARS) + tag(cut) }
+    if (block.content.length <= maxChars) return block
+    const cut = block.content.length - maxChars
+    return { ...block, content: block.content.slice(0, maxChars) + tag(cut) }
   }
   if (Array.isArray(block.content)) {
     let changed = false
     const newContent = block.content.map((p) => {
-      if (p.type === "text" && typeof p.text === "string" && p.text.length > TOOL_RESULT_MAX_CHARS) {
+      if (p.type === "text" && typeof p.text === "string" && p.text.length > maxChars) {
         changed = true
-        const cut = p.text.length - TOOL_RESULT_MAX_CHARS
-        return { ...p, text: p.text.slice(0, TOOL_RESULT_MAX_CHARS) + tag(cut) }
+        const cut = p.text.length - maxChars
+        return { ...p, text: p.text.slice(0, maxChars) + tag(cut) }
       }
       return p
     })
@@ -72,8 +169,12 @@ function estimateTokens(req) {
   return Math.ceil(text.length / CHARS_PER_TOKEN)
 }
 
-function compactRequest(req) {
+function compactRequest(req, opts = {}) {
   if (!Array.isArray(req.messages) || req.messages.length === 0) return req
+
+  const keepRecent = opts.keepRecent ?? KEEP_RECENT_TOOL_RESULTS
+  const maxChars = opts.maxChars ?? TOOL_RESULT_MAX_CHARS
+  const budget = opts.maxPromptTokens ?? MAX_PROMPT_TOKENS
 
   // Step 1: locate every tool_result in user messages
   const locations = []
@@ -86,7 +187,7 @@ function compactRequest(req) {
 
   let truncatedCount = 0
   let newMessages = req.messages
-  const toTruncate = locations.slice(0, Math.max(0, locations.length - KEEP_RECENT_TOOL_RESULTS))
+  const toTruncate = locations.slice(0, Math.max(0, locations.length - keepRecent))
   if (toTruncate.length > 0) {
     const keyed = new Set(toTruncate.map((l) => `${l.mi}:${l.pi}`))
     newMessages = req.messages.map((msg, mi) => {
@@ -94,7 +195,7 @@ function compactRequest(req) {
       let changed = false
       const newContent = msg.content.map((part, pi) => {
         if (part.type !== "tool_result" || !keyed.has(`${mi}:${pi}`)) return part
-        const next = truncateToolResultBlock(part)
+        const next = truncateToolResultBlock(part, maxChars)
         if (next !== part) {
           changed = true
           truncatedCount++
@@ -108,9 +209,9 @@ function compactRequest(req) {
   // Step 2: drop oldest messages while estimate exceeds budget; preserve pairs
   let droppedCount = 0
   let estimate = estimateTokens({ ...req, messages: newMessages })
-  if (estimate > MAX_PROMPT_TOKENS) {
+  if (estimate > budget) {
     let trimmed = [...newMessages]
-    while (estimate > MAX_PROMPT_TOKENS && trimmed.length > 2) {
+    while (estimate > budget && trimmed.length > 2) {
       trimmed.shift()
       droppedCount++
       while (trimmed.length > 0 && isOrphanToolResult(trimmed[0])) {
@@ -122,6 +223,26 @@ function compactRequest(req) {
     newMessages = trimmed
   }
 
+  // Step 3: if still over budget, truncate recent tool_results too (the
+  // current oversized MCP response is itself the offender)
+  if (estimate > budget) {
+    newMessages = newMessages.map((msg) => {
+      if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
+      let changed = false
+      const newContent = msg.content.map((part) => {
+        if (part.type !== "tool_result") return part
+        const next = truncateToolResultBlock(part, maxChars)
+        if (next !== part) {
+          changed = true
+          truncatedCount++
+        }
+        return next
+      })
+      return changed ? { ...msg, content: newContent } : msg
+    })
+    estimate = estimateTokens({ ...req, messages: newMessages })
+  }
+
   if (truncatedCount > 0 || droppedCount > 0) {
     console.log(
       `  ✂ Compaction: truncated ${truncatedCount} old tool_result(s), dropped ${droppedCount} message(s), est ~${estimate} tokens`
@@ -129,6 +250,31 @@ function compactRequest(req) {
   }
 
   return truncatedCount > 0 || droppedCount > 0 ? { ...req, messages: newMessages } : req
+}
+
+// Detect Copilot's prompt-overflow error so we can recompact + retry rather
+// than killing the session.
+function isPromptOverflowError(status, text) {
+  if (status !== 400 && status !== 413) return false
+  const s = (text || "").toLowerCase()
+  return (
+    s.includes("model_max_prompt_tokens_exceeded") ||
+    s.includes("max_prompt_tokens") ||
+    s.includes("prompt is too long") ||
+    s.includes("context length") ||
+    s.includes("too many tokens")
+  )
+}
+
+// Aggressive recompaction for retry-on-overflow: drop the "keep recent"
+// guarantee and halve per-result budget so the current oversized MCP
+// response is also trimmed.
+function aggressiveCompact(anthropicReq) {
+  return compactRequest(anthropicReq, {
+    keepRecent: 0,
+    maxChars: Math.max(2000, Math.floor(TOOL_RESULT_MAX_CHARS / 2)),
+    maxPromptTokens: Math.floor(MAX_PROMPT_TOKENS * 0.85),
+  })
 }
 
 // ─── Web Search ──────────────────────────────────────────────────────────────
@@ -315,6 +461,107 @@ async function duckDuckGoInstantAnswer(query) {
 }
 
 /**
+ * fetch wrapper that retries on transient errors (429, 503) up to twice.
+ * Honors `Retry-After` (seconds or HTTP-date) when present; otherwise uses
+ * exponential backoff (1s, 2s, 4s). Never retries client errors other than
+ * 429 — those are caller bugs and should bubble up. Prompt-overflow 400s are
+ * also not retried here; they have a dedicated recompaction path.
+ */
+async function fetchWithRetry(url, opts, { retries = 2, label = "copilot" } = {}) {
+  const RETRY_STATUSES = new Set([429, 503])
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, opts)
+    if (res.ok || !RETRY_STATUSES.has(res.status) || attempt === retries) {
+      return res
+    }
+    const ra = res.headers.get("retry-after")
+    let waitMs
+    if (ra) {
+      const asInt = parseInt(ra, 10)
+      if (!Number.isNaN(asInt)) {
+        waitMs = asInt * 1000
+      } else {
+        const asDate = Date.parse(ra)
+        waitMs = Number.isNaN(asDate) ? null : Math.max(0, asDate - Date.now())
+      }
+    }
+    if (waitMs == null) waitMs = 1000 * Math.pow(2, attempt) // 1s, 2s, 4s
+    // Cap individual wait at 30s to avoid hanging sessions on broken servers.
+    waitMs = Math.min(waitMs, 30_000)
+    console.log(
+      `  ↻ ${label} ${res.status} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${retries})`
+    )
+    // Drain body so the socket can be reused.
+    try { await res.text() } catch {}
+    await new Promise((r) => setTimeout(r, waitMs))
+  }
+  // Unreachable — loop always returns by attempt === retries branch.
+  throw new Error(`fetchWithRetry: exhausted retries without response (${label})`)
+}
+
+/**
+ * Lazy-fetch Copilot's real model catalog. The hardcoded /v1/models list we
+ * ship works as a fallback, but the live catalog tracks new Copilot rollouts
+ * (and respects what the user's subscription tier actually exposes).
+ *
+ * Cached in-memory for 1h. Fetch failures fall back to the static list — we
+ * never block /v1/models on a Copilot outage.
+ */
+const MODEL_CACHE_TTL_MS = 60 * 60 * 1000
+let modelCache = { fetchedAt: 0, models: null }
+
+// Hardcoded fallback — also used by the synthetic /v1/models when we want to
+// surface Anthropic-style aliases that Copilot's catalog doesn't list
+// verbatim (e.g. dated suffixes Claude Code sends).
+const STATIC_MODEL_FALLBACK = [
+  "claude-opus-4-7",
+  "claude-opus-4-7-latest",
+  "claude-opus-4-6",
+  "claude-opus-4-6-latest",
+  "claude-opus-4-5",
+  "claude-opus-4-5-20251101",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-6-latest",
+  "claude-sonnet-4-5",
+  "claude-sonnet-4-5-20250929",
+  "claude-sonnet-4-20250514",
+  "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
+]
+
+async function fetchCopilotModels(token) {
+  const now = Date.now()
+  if (modelCache.models && now - modelCache.fetchedAt < MODEL_CACHE_TTL_MS) {
+    return modelCache.models
+  }
+  try {
+    const res = await fetch(`${COPILOT_API_BASE}/models`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "User-Agent": USER_AGENT,
+      },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    // Copilot wraps the list under `data` like OpenAI does. Be liberal in
+    // what we accept in case the wire shape shifts.
+    const raw = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
+    // Only keep Claude entries — Copilot returns GPT models too, which CC
+    // can't use. Each entry has at least `{ id }`; preserve passthrough
+    // fields so CC's model picker has full metadata.
+    const claudeModels = raw.filter((m) => typeof m?.id === "string" && m.id.includes("claude"))
+    if (claudeModels.length === 0) throw new Error("no claude models in response")
+    modelCache = { fetchedAt: now, models: claudeModels }
+    console.log(`  ⚡ Cached ${claudeModels.length} Copilot Claude models for 1h`)
+    return claudeModels
+  } catch (err) {
+    console.warn(`  ⚠ Copilot /models fetch failed (${err.message}) — using static fallback`)
+    return null
+  }
+}
+
+
+/**
  * Collect a full non-streaming response from Copilot.
  * Used internally for the web search tool call loop.
  */
@@ -330,11 +577,11 @@ async function collectCopilotResponse(openaiReq, token) {
   if (hasImages) headers["Copilot-Vision-Request"] = "true"
 
   const reqBody = { ...openaiReq, stream: false }
-  const copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(reqBody),
-  })
+  const copilotRes = await fetchWithRetry(
+    `${COPILOT_API_BASE}/chat/completions`,
+    { method: "POST", headers, body: JSON.stringify(reqBody) },
+    { label: "copilot-collect" }
+  )
   if (!copilotRes.ok) {
     const errorText = await copilotRes.text()
     throw new Error(`Copilot API error (${copilotRes.status}): ${errorText}`)
@@ -383,7 +630,7 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
             type: "tool_use",
             id: tc.id,
             name: tc.function.name,
-            input: (() => { try { return JSON.parse(tc.function.arguments) } catch { return {} } })(),
+            input: safeParseToolArgs(tc.function?.arguments, tc.function?.name),
           })
         }
       }
@@ -525,6 +772,29 @@ function mapModel(anthropicModel) {
 
   // Pass through as-is
   return anthropicModel
+}
+
+// Generous-but-safe default output cap per model. Anthropic's CC defaults to
+// model max; Copilot still honors smaller values cleanly (`finish_reason:
+// "length"`) so over-cap is non-fatal — but it does truncate code. Pick a
+// value large enough that "write a long file" tasks complete in one turn.
+const MODEL_MAX_OUTPUT = {
+  "claude-opus-4.7": 16384,
+  "claude-opus-4.6": 16384,
+  "claude-opus-4.5": 16384,
+  "claude-sonnet-4.6": 16384,
+  "claude-sonnet-4.5": 8192,
+  "claude-haiku-4.5": 8192,
+}
+const DEFAULT_MAX_OUTPUT_OVERRIDE = cfgInt(
+  "COPILOT_DEFAULT_MAX_OUTPUT",
+  "default_max_output",
+  0
+)
+
+function defaultMaxOutput(copilotModel) {
+  if (DEFAULT_MAX_OUTPUT_OVERRIDE > 0) return DEFAULT_MAX_OUTPUT_OVERRIDE
+  return MODEL_MAX_OUTPUT[copilotModel] || 4096
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
@@ -741,6 +1011,17 @@ function translateResponseToAnthropic(openaiResponse, model) {
 
   const content = []
 
+  // Reasoning / thinking — Opus 4.7 with reasoning_effort returns this.
+  // Surface as Anthropic's thinking block so CC's UI renders it. Must come
+  // before text/tool_use blocks (matches Anthropic SDK ordering).
+  const reasoning =
+    (typeof choice.message?.reasoning_content === "string" && choice.message.reasoning_content) ||
+    (typeof choice.message?.reasoning === "string" && choice.message.reasoning) ||
+    ""
+  if (reasoning) {
+    content.push({ type: "thinking", thinking: reasoning, signature: "" })
+  }
+
   // Text content
   if (choice.message?.content) {
     content.push({ type: "text", text: choice.message.content })
@@ -753,13 +1034,7 @@ function translateResponseToAnthropic(openaiResponse, model) {
         type: "tool_use",
         id: tc.id,
         name: tc.function.name,
-        input: (() => {
-          try {
-            return JSON.parse(tc.function.arguments)
-          } catch {
-            return {}
-          }
-        })(),
+        input: safeParseToolArgs(tc.function?.arguments, tc.function?.name),
       })
     }
   }
@@ -789,13 +1064,16 @@ function translateResponseToAnthropic(openaiResponse, model) {
 
 // ─── Streaming Translation ──────────────────────────────────────────────────
 
-function createStreamTranslator(model, res) {
+function createStreamTranslator(model, res, anthropicReq) {
   let messageId = `msg_${Date.now()}`
   let inputTokens = 0
   let outputTokens = 0
   let cacheReadTokens = 0
   let sentStart = false
   let toolCallBuffers = {} // id -> {name, arguments}
+  // Char counter used to estimate output_tokens when Copilot omits usage
+  // (some tool-call turns ship the final chunk without `usage`).
+  let outputCharCount = 0
 
   function sendSSE(event, data) {
     const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -830,6 +1108,14 @@ function createStreamTranslator(model, res) {
     processChunk(chunk) {
       // Parse OpenAI SSE chunk
       if (!chunk || chunk === "[DONE]") {
+        // Fall back to estimation when Copilot omits usage (happens on some
+        // tool-call turns). Better an approximation than 0s in CC's /cost.
+        if (inputTokens === 0 && anthropicReq) {
+          inputTokens = estimateTokens(anthropicReq)
+        }
+        if (outputTokens === 0 && outputCharCount > 0) {
+          outputTokens = Math.ceil(outputCharCount / CHARS_PER_TOKEN)
+        }
         // Send message_stop
         sendSSE("message_delta", {
           type: "message_delta",
@@ -845,6 +1131,9 @@ function createStreamTranslator(model, res) {
           },
         })
         sendSSE("message_stop", { type: "message_stop" })
+        // Stash for the request handler's summary log.
+        this._finalInputTokens = inputTokens
+        this._finalOutputTokens = outputTokens
         return true // done
       }
 
@@ -873,8 +1162,51 @@ function createStreamTranslator(model, res) {
       const delta = choice.delta
       if (DEBUG_STREAM) console.log(`  [stream] delta=${JSON.stringify(delta)?.substring(0, 120)} finish=${choice.finish_reason || ""}`)
 
+      // Reasoning / thinking (Opus 4.7 with reasoning_effort). Copilot uses
+      // `reasoning_content`; some providers emit `reasoning`. Surface as
+      // Anthropic's thinking content block so CC's UI can render it.
+      const reasoningChunk =
+        (typeof delta?.reasoning_content === "string" && delta.reasoning_content) ||
+        (typeof delta?.reasoning === "string" && delta.reasoning) ||
+        ""
+      if (reasoningChunk) {
+        if (!this._inThinkingBlock) {
+          sendSSE("content_block_start", {
+            type: "content_block_start",
+            index: contentBlockIndex,
+            content_block: { type: "thinking", thinking: "" },
+          })
+          this._inThinkingBlock = true
+        }
+        sendSSE("content_block_delta", {
+          type: "content_block_delta",
+          index: contentBlockIndex,
+          delta: { type: "thinking_delta", thinking: reasoningChunk },
+        })
+      }
+
+      // Close thinking block when we transition to text or tool_use output
+      const startingTextOrTool = (delta?.content && !this._inTextBlock) || delta?.tool_calls
+      if (this._inThinkingBlock && startingTextOrTool) {
+        // Anthropic's spec includes a signature_delta before closing thinking
+        // (server-side cryptographic stamp). Copilot doesn't provide one, so
+        // we emit a placeholder to keep CC's parser happy and close the block.
+        sendSSE("content_block_delta", {
+          type: "content_block_delta",
+          index: contentBlockIndex,
+          delta: { type: "signature_delta", signature: "" },
+        })
+        sendSSE("content_block_stop", {
+          type: "content_block_stop",
+          index: contentBlockIndex,
+        })
+        contentBlockIndex++
+        this._inThinkingBlock = false
+      }
+
       // Text content
       if (delta?.content) {
+        outputCharCount += delta.content.length
         if (!this._inTextBlock) {
           sendSSE("content_block_start", {
             type: "content_block_start",
@@ -948,6 +1280,19 @@ function createStreamTranslator(model, res) {
       // sends a final chunk with usage AFTER the finish_reason chunk; if we
       // emit message_stop here we'd report 0 input/output tokens.
       if (choice.finish_reason) {
+        if (this._inThinkingBlock) {
+          sendSSE("content_block_delta", {
+            type: "content_block_delta",
+            index: contentBlockIndex,
+            delta: { type: "signature_delta", signature: "" },
+          })
+          sendSSE("content_block_stop", {
+            type: "content_block_stop",
+            index: contentBlockIndex,
+          })
+          contentBlockIndex++
+          this._inThinkingBlock = false
+        }
         if (this._inTextBlock) {
           sendSSE("content_block_stop", {
             type: "content_block_stop",
@@ -973,6 +1318,7 @@ function createStreamTranslator(model, res) {
     },
 
     _inTextBlock: false,
+    _inThinkingBlock: false,
     _stopReason: null,
   }
 }
@@ -1047,18 +1393,40 @@ async function handleRequest(req, res, token) {
     return
   }
 
-  // Handle models list endpoint — Claude Code may probe this
+  // Handle models list endpoint — Claude Code may probe this. We surface the
+  // live Copilot catalog (cached 1h) so new model rollouts appear without a
+  // proxy update, plus Anthropic-style aliases (`claude-sonnet-4-5`) that
+  // Claude Code typically sends as the model ID. On Copilot fetch failure
+  // we fall back to the static alias list alone.
   if (url.includes("/models")) {
-    console.log(`  ⚡ Models endpoint hit — returning available models`)
+    const live = await fetchCopilotModels(token)
+    const aliasIds = new Set(STATIC_MODEL_FALLBACK)
+    if (live) {
+      // Add any live IDs not already represented (e.g. new opus rollouts).
+      for (const m of live) if (m?.id) aliasIds.add(m.id)
+      // Some downstream tooling matches on the dotless dash form — also
+      // include translated aliases for each live id.
+      for (const m of live) {
+        if (typeof m?.id === "string" && m.id.includes(".")) {
+          aliasIds.add(m.id.replace(/\./g, "-"))
+        }
+      }
+      const liveById = new Map(live.map((m) => [m.id, m]))
+      const merged = [...aliasIds].map((id) => {
+        const dotForm = id.replace(/-(\d)-(\d)$/, "-$1.$2")
+        const meta = liveById.get(id) || liveById.get(dotForm)
+        return meta ? { ...meta, id } : { id, object: "model" }
+      })
+      console.log(`  ⚡ Models endpoint → ${merged.length} (${live.length} live + aliases)`)
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ object: "list", data: merged }))
+      return
+    }
+    console.log(`  ⚡ Models endpoint → static fallback (${STATIC_MODEL_FALLBACK.length} entries)`)
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({
-      data: [
-        { id: "claude-opus-4-6", object: "model" },
-        { id: "claude-sonnet-4-5-20250929", object: "model" },
-        { id: "claude-sonnet-4-20250514", object: "model" },
-        { id: "claude-opus-4-5-20251101", object: "model" },
-        { id: "claude-haiku-4-5", object: "model" },
-      ]
+      object: "list",
+      data: STATIC_MODEL_FALLBACK.map((id) => ({ id, object: "model" })),
     }))
     return
   }
@@ -1100,6 +1468,7 @@ async function handleRequest(req, res, token) {
   // Compact request to fit under Copilot's 128K prompt cap.
   // Chrome DevTools MCP / CDP snapshots are the dominant cost driver — we
   // truncate older tool_result blocks first, then drop oldest message pairs.
+  anthropicReq = stripCacheControl(anthropicReq)
   anthropicReq = compactRequest(anthropicReq)
 
   // Check for web_search tool
@@ -1116,7 +1485,7 @@ async function handleRequest(req, res, token) {
   const openaiReq = {
     model: copilotModel,
     messages: translateMessages(anthropicReq.messages, anthropicReq.system),
-    max_tokens: anthropicReq.max_tokens || 4096,
+    max_tokens: anthropicReq.max_tokens || defaultMaxOutput(copilotModel),
     stream: isStream,
   }
 
@@ -1393,14 +1762,39 @@ async function handleRequest(req, res, token) {
     }
 
     // ── Normal Path (no web search) ──
-    const copilotRes = await fetch(
+    let copilotRes = await fetchWithRetry(
       `${COPILOT_API_BASE}/chat/completions`,
       {
         method: "POST",
         headers,
         body: JSON.stringify(openaiReq),
-      }
+      },
+      { label: "copilot-stream" }
     )
+
+    // Retry once on prompt overflow: recompact aggressively (drop keep-recent
+    // floor, halve per-result budget) and resend. Without this a single
+    // oversized MCP response kills the session with no recovery.
+    if (!copilotRes.ok && (copilotRes.status === 400 || copilotRes.status === 413)) {
+      const errorText = await copilotRes.clone().text()
+      if (isPromptOverflowError(copilotRes.status, errorText)) {
+        console.log(`  ⚠ Prompt overflow detected — recompacting aggressively and retrying once`)
+        const recompacted = aggressiveCompact(anthropicReq)
+        const retryOpenai = {
+          ...openaiReq,
+          messages: translateMessages(recompacted.messages, recompacted.system),
+        }
+        copilotRes = await fetchWithRetry(
+          `${COPILOT_API_BASE}/chat/completions`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(retryOpenai),
+          },
+          { label: "copilot-overflow-retry" }
+        )
+      }
+    }
 
     if (!copilotRes.ok) {
       const errorText = await copilotRes.text()
@@ -1412,14 +1806,7 @@ async function handleRequest(req, res, token) {
         JSON.stringify({
           type: "error",
           error: {
-            type:
-              copilotRes.status === 401
-                ? "authentication_error"
-                : copilotRes.status === 429
-                  ? "rate_limit_error"
-                  : copilotRes.status === 403
-                    ? "permission_error"
-                    : "api_error",
+            type: anthropicErrorType(copilotRes.status),
             message: `Copilot API error (${copilotRes.status}): ${errorText}`,
           },
         })
@@ -1435,45 +1822,76 @@ async function handleRequest(req, res, token) {
         Connection: "keep-alive",
       })
 
-      const translator = createStreamTranslator(anthropicReq.model, res)
+      const translator = createStreamTranslator(anthropicReq.model, res, anthropicReq)
+
+      // Periodic ping keeps the SSE connection alive through idle intervals
+      // (long thinking, slow tool plans). Matches Anthropic's behavior and
+      // prevents NAT/VPN/proxy timeouts mid-stream.
+      const PING_INTERVAL_MS = 10_000
+      const pingTimer = setInterval(() => {
+        try {
+          if (!res.writableEnded) {
+            res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`)
+          }
+        } catch { /* ignore — cleanup runs below */ }
+      }, PING_INTERVAL_MS)
+      const stopPings = () => clearInterval(pingTimer)
+      res.on("close", stopPings)
+      res.on("error", stopPings)
+      req.on("close", stopPings)
 
       const reader = copilotRes.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+      const logUsage = () => {
+        const i = translator._finalInputTokens || 0
+        const o = translator._finalOutputTokens || 0
+        if (i || o) console.log(`  ⌁ usage: ${i} in / ${o} out`)
+      }
 
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split("\n")
-        buffer = lines.pop() || ""
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue
-          const data = line.slice(6).trim()
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split("\n")
+          buffer = lines.pop() || ""
 
-          if (data === "[DONE]") {
-            translator.processChunk("[DONE]")
-            res.end()
-            return
-          }
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue
+            const data = line.slice(6).trim()
 
-          try {
-            const parsed = JSON.parse(data)
-            const isDone = translator.processChunk(parsed)
-            if (isDone) {
+            if (data === "[DONE]") {
+              translator.processChunk("[DONE]")
+              logUsage()
+              stopPings()
               res.end()
               return
             }
-          } catch {
-            // Skip unparseable chunks
+
+            try {
+              const parsed = JSON.parse(data)
+              const isDone = translator.processChunk(parsed)
+              if (isDone) {
+                logUsage()
+                stopPings()
+                res.end()
+                return
+              }
+            } catch {
+              // Skip unparseable chunks
+            }
           }
         }
-      }
 
-      // If we get here without [DONE], clean up
-      translator.processChunk("[DONE]")
+        // If we get here without [DONE], clean up
+        translator.processChunk("[DONE]")
+        logUsage()
+      } finally {
+        stopPings()
+      }
       res.end()
     } else {
       // Non-streaming response
@@ -1482,6 +1900,8 @@ async function handleRequest(req, res, token) {
         openaiData,
         anthropicReq.model
       )
+      const u = anthropicRes?.usage
+      if (u) console.log(`  ⌁ usage: ${u.input_tokens || 0} in / ${u.output_tokens || 0} out`)
 
       res.writeHead(200, { "Content-Type": "application/json" })
       res.end(JSON.stringify(anthropicRes))
@@ -1544,7 +1964,7 @@ server.listen(PORT, () => {
   console.log()
   console.log("  Use Claude Code with:")
   console.log(
-    `  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=${PROXY_API_KEY || "copilot-proxy"} claude`
+    `  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_AUTH_TOKEN=${PROXY_API_KEY || "copilot-proxy"} claude`
   )
   console.log()
   console.log("  Press Ctrl+C to stop")

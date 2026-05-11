@@ -72,5 +72,5 @@ echo "Starting Claude Code via Copilot..."
 echo ""
 
 ANTHROPIC_BASE_URL="http://localhost:$PORT" \
-ANTHROPIC_API_KEY="copilot-proxy" \
+ANTHROPIC_AUTH_TOKEN="copilot-proxy" \
 claude "$@"
