@@ -203,45 +203,34 @@ function compactRequest(req, opts = {}) {
   const maxChars = opts.maxChars ?? TOOL_RESULT_MAX_CHARS
   const budget = opts.maxPromptTokens ?? MAX_PROMPT_TOKENS
 
-  // Step 1: locate every tool_result in user messages
-  const locations = []
-  req.messages.forEach((msg, mi) => {
-    if (msg.role !== "user" || !Array.isArray(msg.content)) return
-    msg.content.forEach((part, pi) => {
-      if (part.type === "tool_result") locations.push({ mi, pi })
-    })
-  })
+  // Fast path: already under budget — nothing to do, no mutations.
+  let estimate = estimateTokens(req)
+  if (estimate <= budget) return req
 
-  let truncatedCount = 0
   let newMessages = req.messages
-  const toTruncate = locations.slice(0, Math.max(0, locations.length - keepRecent))
-  if (toTruncate.length > 0) {
-    const keyed = new Set(toTruncate.map((l) => `${l.mi}:${l.pi}`))
-    newMessages = req.messages.map((msg, mi) => {
-      if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
-      let changed = false
-      const newContent = msg.content.map((part, pi) => {
-        if (part.type !== "tool_result" || !keyed.has(`${mi}:${pi}`)) return part
-        const next = truncateToolResultBlock(part, maxChars)
-        if (next !== part) {
-          changed = true
-          truncatedCount++
-        }
-        return next
-      })
-      return changed ? { ...msg, content: newContent } : msg
-    })
-  }
-
-  // Step 2: drop oldest messages while estimate exceeds budget; preserve pairs
+  let truncatedCount = 0
   let droppedCount = 0
-  let estimate = estimateTokens({ ...req, messages: newMessages })
+
+  // Step 1: drop oldest message pairs (lossless) until under budget.
+  // Prefer this over lossy truncation — dropped pairs leave the remaining
+  // history intact. We drop in increments of one message at a time so we
+  // can stop as soon as we're under the budget.
   if (estimate > budget) {
     let trimmed = [...newMessages]
     while (estimate > budget && trimmed.length > 2) {
       trimmed.shift()
       droppedCount++
+      // Drop any orphan tool_result-only user messages left at the front.
       while (trimmed.length > 0 && isOrphanToolResult(trimmed[0])) {
+        trimmed.shift()
+        droppedCount++
+      }
+      // Drop any leading assistant messages — the Anthropic API requires the
+      // first message to be a user message. When we drop an old user→assistant
+      // pair the next message may be an assistant turn; leaving it at position
+      // 0 causes the model to see an empty / phantom user turn before it,
+      // which produces the "<<HUMAN_CONVERSATION_START>>" empty-message bug.
+      while (trimmed.length > 0 && trimmed[0].role === "assistant") {
         trimmed.shift()
         droppedCount++
       }
@@ -250,8 +239,39 @@ function compactRequest(req, opts = {}) {
     newMessages = trimmed
   }
 
-  // Step 3: if still over budget, truncate recent tool_results too (the
-  // current oversized MCP response is itself the offender)
+  // Step 2: still over budget — truncate old tool results (lossy, targeted).
+  // Only touch results older than the `keepRecent` most recent ones.
+  if (estimate > budget) {
+    const locations = []
+    newMessages.forEach((msg, mi) => {
+      if (msg.role !== "user" || !Array.isArray(msg.content)) return
+      msg.content.forEach((part, pi) => {
+        if (part.type === "tool_result") locations.push({ mi, pi })
+      })
+    })
+    const toTruncate = locations.slice(0, Math.max(0, locations.length - keepRecent))
+    if (toTruncate.length > 0) {
+      const keyed = new Set(toTruncate.map((l) => `${l.mi}:${l.pi}`))
+      newMessages = newMessages.map((msg, mi) => {
+        if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
+        let changed = false
+        const newContent = msg.content.map((part, pi) => {
+          if (part.type !== "tool_result" || !keyed.has(`${mi}:${pi}`)) return part
+          const next = truncateToolResultBlock(part, maxChars)
+          if (next !== part) {
+            changed = true
+            truncatedCount++
+          }
+          return next
+        })
+        return changed ? { ...msg, content: newContent } : msg
+      })
+      estimate = estimateTokens({ ...req, messages: newMessages })
+    }
+  }
+
+  // Step 3: last resort — truncate even the most recent tool results
+  // (e.g. a single oversized MCP response is itself the offender).
   if (estimate > budget) {
     newMessages = newMessages.map((msg) => {
       if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
