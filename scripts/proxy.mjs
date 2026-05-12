@@ -220,19 +220,34 @@ function compactRequest(req, opts = {}) {
     while (estimate > budget && trimmed.length > 2) {
       trimmed.shift()
       droppedCount++
-      // Drop any orphan tool_result-only user messages left at the front.
-      while (trimmed.length > 0 && isOrphanToolResult(trimmed[0])) {
-        trimmed.shift()
-        droppedCount++
-      }
-      // Drop any leading assistant messages — the Anthropic API requires the
-      // first message to be a user message. When we drop an old user→assistant
-      // pair the next message may be an assistant turn; leaving it at position
-      // 0 causes the model to see an empty / phantom user turn before it,
-      // which produces the "<<HUMAN_CONVERSATION_START>>" empty-message bug.
-      while (trimmed.length > 0 && trimmed[0].role === "assistant") {
-        trimmed.shift()
-        droppedCount++
+      // Clean up the front in a loop until stable: dropping an assistant
+      // message can expose an orphan tool_result user message, and dropping
+      // that can expose another leading assistant, so we alternate until
+      // neither condition fires.
+      //
+      // Without the loop the sequencing bug is:
+      //   [user-A] [asst-B: tool_use X] [user-C: tool_result X] ...
+      //   shift user-A → front is asst-B → isOrphanToolResult=false, skip
+      //   drop asst-B (leading assistant) → front is user-C: tool_result X
+      //   → orphan NOT caught because we already passed that check
+      //   → Copilot 400: "unexpected tool_use_id … no corresponding tool_use"
+      let cleaning = true
+      while (cleaning && trimmed.length > 0) {
+        cleaning = false
+        // Drop orphan tool_result-only user messages at the front (their
+        // paired assistant tool_use was already dropped).
+        while (trimmed.length > 0 && isOrphanToolResult(trimmed[0])) {
+          trimmed.shift()
+          droppedCount++
+          cleaning = true
+        }
+        // Drop leading assistant messages — the Anthropic API requires the
+        // first message to be a user message.
+        while (trimmed.length > 0 && trimmed[0].role === "assistant") {
+          trimmed.shift()
+          droppedCount++
+          cleaning = true
+        }
       }
       estimate = estimateTokens({ ...req, messages: trimmed })
     }
